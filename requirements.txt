@@ -1,0 +1,5 @@
+# No external dependencies required - uses built-in tkinter
+# This tool uses only Python standard library modules:
+# - tkinter (GUI framework)
+# - json (for saving/loading diagrams)
+# - math (for relationship arrow calculations)
