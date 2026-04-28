@@ -1,8 +1,263 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
+import json
 import math
 import re
 import os
+
+
+def get_label_perpendicular_vector(from_point, to_point, side=1):
+    """Return a normalized perpendicular vector with a stable screen-up bias."""
+    dx = to_point[0] - from_point[0]
+    dy = to_point[1] - from_point[1]
+    length = math.hypot(dx, dy)
+    if length == 0:
+        return 0.0, -1.0
+
+    perp_x = -dy / length
+    perp_y = dx / length
+    # Keep the label visually "above" the line in screen space when possible.
+    if perp_y > 0:
+        perp_x *= -1
+        perp_y *= -1
+
+    return perp_x * side, perp_y * side
+
+
+def get_perpendicular_label_position(from_point, to_point, offset, side=1):
+    """Return a point offset from the line midpoint along its perpendicular."""
+    mid_x = (from_point[0] + to_point[0]) / 2
+    mid_y = (from_point[1] + to_point[1]) / 2
+    perp_x, perp_y = get_label_perpendicular_vector(from_point, to_point, side=side)
+    return mid_x + (perp_x * offset), mid_y + (perp_y * offset)
+
+
+def get_endpoint_label_position(point, other_point, along_offset, perpendicular_offset, side=1):
+    """Offset a label near a connection endpoint using the line direction."""
+    dx = other_point[0] - point[0]
+    dy = other_point[1] - point[1]
+    length = math.hypot(dx, dy)
+    if length == 0:
+        return point[0] + along_offset, point[1] - perpendicular_offset
+
+    unit_x = dx / length
+    unit_y = dy / length
+    perp_x = -unit_y
+    perp_y = unit_x
+    if perp_y > 0:
+        perp_x *= -1
+        perp_y *= -1
+
+    return (
+        point[0] + (unit_x * along_offset) + (perp_x * perpendicular_offset * side),
+        point[1] + (unit_y * along_offset) + (perp_y * perpendicular_offset * side),
+    )
+
+
+def get_centered_text_width(width, ratio, minimum=40):
+    """Compute a reasonable wrapped text width inside a scaled shape."""
+    return max(minimum, int(width * ratio))
+
+
+def get_outside_box_label_position(center_point, edge_point, other_point, outward_offset, along_offset=0):
+    """Place endpoint text outside a node by moving away from its center."""
+    center_dx = edge_point[0] - center_point[0]
+    center_dy = edge_point[1] - center_point[1]
+    center_length = math.hypot(center_dx, center_dy)
+    if center_length == 0:
+        outward_x, outward_y = 0, -1
+    else:
+        outward_x = center_dx / center_length
+        outward_y = center_dy / center_length
+
+    line_dx = other_point[0] - edge_point[0]
+    line_dy = other_point[1] - edge_point[1]
+    line_length = math.hypot(line_dx, line_dy)
+    if line_length == 0:
+        line_x, line_y = 0, 0
+    else:
+        line_x = line_dx / line_length
+        line_y = line_dy / line_length
+
+    return (
+        edge_point[0] + (outward_x * outward_offset) + (line_x * along_offset),
+        edge_point[1] + (outward_y * outward_offset) + (line_y * along_offset),
+    )
+
+
+def get_rect_intersection(center, direction, rect):
+    """Find the intersection point of a ray from a rectangle center to its edge."""
+    cx, cy = center
+    dx, dy = direction
+    intersections = []
+
+    if dx > 0:
+        t = (rect['right'] - cx) / dx
+        y = cy + t * dy
+        if rect['top'] <= y <= rect['bottom']:
+            intersections.append((rect['right'], y))
+
+    if dx < 0:
+        t = (rect['left'] - cx) / dx
+        y = cy + t * dy
+        if rect['top'] <= y <= rect['bottom']:
+            intersections.append((rect['left'], y))
+
+    if dy > 0:
+        t = (rect['bottom'] - cy) / dy
+        x = cx + t * dx
+        if rect['left'] <= x <= rect['right']:
+            intersections.append((x, rect['bottom']))
+
+    if dy < 0:
+        t = (rect['top'] - cy) / dy
+        x = cx + t * dx
+        if rect['left'] <= x <= rect['right']:
+            intersections.append((x, rect['top']))
+
+    if intersections:
+        return min(intersections, key=lambda point: math.hypot(point[0] - cx, point[1] - cy))
+    return center
+
+
+def get_box_connection_points(from_rect, to_rect):
+    """Calculate line endpoints on the borders of two rectangular nodes."""
+    from_center = ((from_rect['left'] + from_rect['right']) / 2, (from_rect['top'] + from_rect['bottom']) / 2)
+    to_center = ((to_rect['left'] + to_rect['right']) / 2, (to_rect['top'] + to_rect['bottom']) / 2)
+    dx = to_center[0] - from_center[0]
+    dy = to_center[1] - from_center[1]
+    length = math.hypot(dx, dy)
+    if length == 0:
+        return from_center, to_center
+
+    dx_norm = dx / length
+    dy_norm = dy / length
+    from_point = get_rect_intersection(from_center, (dx_norm, dy_norm), from_rect)
+    to_point = get_rect_intersection(to_center, (-dx_norm, -dy_norm), to_rect)
+    return from_point, to_point
+
+
+def move_text_away_from_bboxes(canvas, text_item, origin, step_vector, obstacle_bboxes, step_size=8, max_steps=12, padding=2):
+    """Nudge a text item along a vector until it no longer overlaps obstacles."""
+    step_x = step_vector[0] * step_size
+    step_y = step_vector[1] * step_size
+    for step in range(max_steps + 1):
+        target_x = origin[0] + (step_x * step)
+        target_y = origin[1] + (step_y * step)
+        canvas.coords(text_item, target_x, target_y)
+        bbox = canvas.bbox(text_item)
+        if not bbox:
+            return
+        if not any(
+            intersects_bboxes(bbox, obstacle_bbox, padding)
+            for obstacle_bbox in obstacle_bboxes
+            if obstacle_bbox
+        ):
+            return
+
+
+def place_text_avoiding_bboxes(
+    canvas,
+    text_item,
+    preferred_origin,
+    preferred_vector,
+    obstacle_bboxes,
+    alternate_origin=None,
+    alternate_vector=None,
+    step_size=8,
+    max_steps=12,
+    padding=2,
+):
+    """Place text using a preferred direction, then try the alternate side if needed."""
+    move_text_away_from_bboxes(
+        canvas,
+        text_item,
+        preferred_origin,
+        preferred_vector,
+        obstacle_bboxes,
+        step_size=step_size,
+        max_steps=max_steps,
+        padding=padding,
+    )
+    bbox = canvas.bbox(text_item)
+    if not any(intersects_bboxes(bbox, obstacle_bbox, padding) for obstacle_bbox in obstacle_bboxes if obstacle_bbox):
+        return
+    if alternate_origin is None or alternate_vector is None:
+        return
+    move_text_away_from_bboxes(
+        canvas,
+        text_item,
+        alternate_origin,
+        alternate_vector,
+        obstacle_bboxes,
+        step_size=step_size,
+        max_steps=max_steps,
+        padding=padding,
+    )
+
+
+def place_text_near_line(
+    canvas,
+    text_item,
+    from_point,
+    to_point,
+    obstacle_bboxes,
+    preferred_side=1,
+    base_offset=12,
+    along_offsets=(0, 18, -18, 36, -36, 54, -54),
+    offset_steps=(0, 8, 16, 24, 32, 48, 64),
+    padding=2,
+):
+    """Search for a nearby label position that avoids overlapping obstacles."""
+    dx = to_point[0] - from_point[0]
+    dy = to_point[1] - from_point[1]
+    length = math.hypot(dx, dy)
+    if length == 0:
+        along_x, along_y = 1.0, 0.0
+    else:
+        along_x, along_y = dx / length, dy / length
+
+    sides = [preferred_side]
+    if preferred_side != -preferred_side:
+        sides.append(-preferred_side)
+
+    mid_x = (from_point[0] + to_point[0]) / 2
+    mid_y = (from_point[1] + to_point[1]) / 2
+    fallback = None
+
+    for side in sides:
+        perp_x, perp_y = get_label_perpendicular_vector(from_point, to_point, side=side)
+        for extra_offset in offset_steps:
+            distance = base_offset + extra_offset
+            for along in along_offsets:
+                candidate_x = mid_x + (along_x * along) + (perp_x * distance)
+                candidate_y = mid_y + (along_y * along) + (perp_y * distance)
+                canvas.coords(text_item, candidate_x, candidate_y)
+                bbox = canvas.bbox(text_item)
+                if fallback is None:
+                    fallback = (candidate_x, candidate_y)
+                if not any(
+                    intersects_bboxes(bbox, obstacle_bbox, padding)
+                    for obstacle_bbox in obstacle_bboxes
+                    if obstacle_bbox
+                ):
+                    return
+
+    if fallback is not None:
+        canvas.coords(text_item, fallback[0], fallback[1])
+
+
+def intersects_bboxes(a, b, padding=0):
+    """Return whether two bboxes intersect."""
+    if not a or not b:
+        return False
+    return not (
+        a[2] < b[0] - padding
+        or a[0] > b[2] + padding
+        or a[3] < b[1] - padding
+        or a[1] > b[3] + padding
+    )
+
 
 class ClassBox:
     def __init__(self, canvas, x, y, name="NewClass", tool=None):
@@ -460,7 +715,7 @@ class ClassBox:
                     try:
                         self.tool.save_positions(self.tool.current_file)
                     except Exception as e:
-                        print(f"Warning: Could not auto-save positions: {e}")
+                        self.tool.log_warning(f"Could not auto-save positions: {e}")
                 
                 self._was_dragged = False
         
@@ -777,8 +1032,11 @@ class Relationship:
                 width=line_width, fill=line_color, smooth=True
             )
         
-        # Keep line behind classes
+        # Keep line behind classes but above grid
         self.canvas.tag_lower(self.line)
+        # Raise above grid specifically
+        if self.tool and hasattr(self.tool, 'show_grid') and self.canvas.find_withtag("grid"):
+            self.canvas.tag_raise(self.line, "grid")
         
         # Bind click events to line
         self.canvas.tag_bind(self.line, "<Button-1>", self.on_click)
@@ -804,17 +1062,30 @@ class Relationship:
             
             label_font_size = max(1, int(9 * zoom_level))
             mult_font_size = max(1, int(8 * zoom_level))
-            
-            # Calculate midpoint for label
-            mid_x = (from_point[0] + to_point[0]) / 2
-            mid_y = (from_point[1] + to_point[1]) / 2
+            label_x, label_y = get_perpendicular_label_position(from_point, to_point, int(12 * zoom_level))
             
             # Relationship label
             if self.label:
                 self.label_text = self.canvas.create_text(
-                    mid_x, mid_y - int(10 * zoom_level),
+                    label_x, label_y,
                     text=self.label, font=("Arial", label_font_size),
                     fill="blue", anchor="center"
+                )
+                place_text_near_line(
+                    self.canvas,
+                    self.label_text,
+                    from_point,
+                    to_point,
+                    [
+                        self.canvas.bbox(class_box.rect)
+                        for class_box in self.tool.classes
+                    ] if self.tool else [
+                        self.canvas.bbox(self.from_class.rect),
+                        self.canvas.bbox(self.to_class.rect),
+                    ],
+                    preferred_side=1,
+                    base_offset=int(12 * zoom_level),
+                    padding=2,
                 )
                 # Keep label behind classes
                 self.canvas.tag_lower(self.label_text)
@@ -823,8 +1094,11 @@ class Relationship:
             
             # From multiplicity
             if self.from_multiplicity:
+                from_x, from_y = get_endpoint_label_position(
+                    from_point, to_point, int(16 * zoom_level), int(10 * zoom_level)
+                )
                 self.from_mult_text = self.canvas.create_text(
-                    from_point[0] + int(15 * zoom_level), from_point[1] - int(10 * zoom_level),
+                    from_x, from_y,
                     text=self.from_multiplicity, font=("Arial", mult_font_size),
                     fill="darkgreen", anchor="center"
                 )
@@ -833,8 +1107,11 @@ class Relationship:
             
             # To multiplicity
             if self.to_multiplicity:
+                to_x, to_y = get_endpoint_label_position(
+                    to_point, from_point, int(16 * zoom_level), int(10 * zoom_level)
+                )
                 self.to_mult_text = self.canvas.create_text(
-                    to_point[0] - int(15 * zoom_level), to_point[1] - int(10 * zoom_level),
+                    to_x, to_y,
                     text=self.to_multiplicity, font=("Arial", mult_font_size),
                     fill="darkgreen", anchor="center"
                 )
@@ -873,9 +1150,11 @@ class Relationship:
         )
         self.arrow = [line1, line2]
         
-        # Keep arrows behind classes
+        # Keep arrows behind classes but above grid
         for arrow_part in self.arrow:
             self.canvas.tag_lower(arrow_part)
+            if self.tool and hasattr(self.tool, 'show_grid') and self.canvas.find_withtag("grid"):
+                self.canvas.tag_raise(arrow_part, "grid")
             # Bind events to arrow parts
             self.canvas.tag_bind(arrow_part, "<Button-1>", self.on_click)
             self.canvas.tag_bind(arrow_part, "<Double-Button-1>", self.on_double_click)
@@ -964,8 +1243,10 @@ class Relationship:
             fill="white", outline=arrow_color, width=arrow_width
         )
         
-        # Keep arrow behind classes
+        # Keep arrow behind classes but above grid
         self.canvas.tag_lower(self.arrow)
+        if self.tool and hasattr(self.tool, 'show_grid') and self.canvas.find_withtag("grid"):
+            self.canvas.tag_raise(self.arrow, "grid")
         
         # Bind events to arrow too
         self.canvas.tag_bind(self.arrow, "<Button-1>", self.on_click)
@@ -999,8 +1280,10 @@ class Relationship:
             fill=arrow_color, outline=arrow_color
         )
         
-        # Keep arrow behind classes
+        # Keep arrow behind classes but above grid
         self.canvas.tag_lower(self.arrow)
+        if self.tool and hasattr(self.tool, 'show_grid') and self.canvas.find_withtag("grid"):
+            self.canvas.tag_raise(self.arrow, "grid")
         
         # Bind events to arrow too
         self.canvas.tag_bind(self.arrow, "<Button-1>", self.on_click)
@@ -1035,8 +1318,10 @@ class Relationship:
             fill="white", outline=arrow_color, width=arrow_width
         )
         
-        # Keep arrow behind classes
+        # Keep arrow behind classes but above grid
         self.canvas.tag_lower(self.arrow)
+        if self.tool and hasattr(self.tool, 'show_grid') and self.canvas.find_withtag("grid"):
+            self.canvas.tag_raise(self.arrow, "grid")
         
         # Bind events to arrow too
         self.canvas.tag_bind(self.arrow, "<Button-1>", self.on_click)
@@ -1333,15 +1618,953 @@ class ClassEditDialog:
     def cancel_clicked(self):
         self.dialog.destroy()
 
+class FlowchartNode:
+    """Represents a flowchart node with different shapes"""
+    def __init__(self, canvas, x, y, node_id="node1", text="Node", shape="rectangle", tool=None):
+        self.canvas = canvas
+        self.tool = tool
+        self.x = x
+        self.y = y
+        self.node_id = node_id
+        self.text = text
+        self.shape = shape  # rectangle, rounded, diamond, circle
+        self.width = 120
+        self.height = 60
+        self.selected = False
+        self.drag_data = {"x": 0, "y": 0}
+        
+        self.create_visual()
+    
+    def create_visual(self):
+        """Create visual elements"""
+        zoom_level = 1.0
+        if self.tool and hasattr(self.tool, 'zoom_level'):
+            zoom_level = self.tool.zoom_level
+        
+        # Delete existing elements
+        if hasattr(self, 'shape_item'):
+            self.canvas.delete(self.shape_item)
+        if hasattr(self, 'text_item'):
+            self.canvas.delete(self.text_item)
+        
+        # Scale dimensions
+        w = self.width * zoom_level
+        h = self.height * zoom_level
+        
+        # Draw shape based on type
+        if self.shape == "rectangle":
+            self.shape_item = self.canvas.create_rectangle(
+                self.x, self.y, self.x + w, self.y + h,
+                fill="lightblue", outline="black", width=max(1, int(2 * zoom_level))
+            )
+        elif self.shape == "rounded":
+            self.shape_item = self.canvas.create_rectangle(
+                self.x, self.y, self.x + w, self.y + h,
+                fill="lightgreen", outline="black", width=max(1, int(2 * zoom_level))
+            )
+        elif self.shape == "diamond":
+            cx, cy = self.x + w/2, self.y + h/2
+            self.shape_item = self.canvas.create_polygon(
+                cx, self.y, self.x + w, cy, cx, self.y + h, self.x, cy,
+                fill="lightyellow", outline="black", width=max(1, int(2 * zoom_level))
+            )
+        elif self.shape == "circle":
+            self.shape_item = self.canvas.create_oval(
+                self.x, self.y, self.x + w, self.y + h,
+                fill="lightcoral", outline="black", width=max(1, int(2 * zoom_level))
+            )
+        
+        # Draw text
+        font_size = max(8, int(10 * zoom_level))
+        text_width_ratio = 0.8
+        if self.shape == "diamond":
+            text_width_ratio = 0.55
+        elif self.shape == "circle":
+            text_width_ratio = 0.7
+        self.text_item = self.canvas.create_text(
+            self.x + w/2, self.y + h/2,
+            text=self.text,
+            font=("Arial", font_size),
+            tags="node_text",
+            width=get_centered_text_width(w, text_width_ratio),
+            justify="center"
+        )
+        
+        # Bind events
+        self.canvas.tag_bind(self.shape_item, "<Button-1>", self.on_press)
+        self.canvas.tag_bind(self.shape_item, "<B1-Motion>", self.on_drag)
+        self.canvas.tag_bind(self.shape_item, "<ButtonRelease-1>", self.on_release)
+        self.canvas.tag_bind(self.shape_item, "<Double-Button-1>", self.on_double_click)
+        
+        self.canvas.tag_bind(self.text_item, "<Button-1>", self.on_press)
+        self.canvas.tag_bind(self.text_item, "<B1-Motion>", self.on_drag)
+        self.canvas.tag_bind(self.text_item, "<ButtonRelease-1>", self.on_release)
+        self.canvas.tag_bind(self.text_item, "<Double-Button-1>", self.on_double_click)
+    
+    def on_press(self, event):
+        self.drag_data["x"] = event.x
+        self.drag_data["y"] = event.y
+        if self.tool:
+            self.tool.deselect_all_visuals()
+            self.tool.selected_node = self
+            self.select()
+    
+    def on_drag(self, event):
+        dx = event.x - self.drag_data["x"]
+        dy = event.y - self.drag_data["y"]
+        if dx != 0 or dy != 0:
+            self._was_dragged = True
+        self.x += dx
+        self.y += dy
+        self.drag_data["x"] = event.x
+        self.drag_data["y"] = event.y
+        self.canvas.move(self.shape_item, dx, dy)
+        self.canvas.move(self.text_item, dx, dy)
+        if self.tool:
+            self.tool.update_relationships()
+    
+    def on_release(self, event):
+        if self.tool:
+            self.tool.update_scroll_region()
+            if hasattr(self, '_was_dragged') and self._was_dragged:
+                self.tool.mark_as_changed()
+                self._was_dragged = False
+            self.tool.save_positions()
+    
+    def on_double_click(self, event):
+        new_text = simpledialog.askstring("Edit Node", "Enter node text:", initialvalue=self.text)
+        if new_text:
+            self.text = new_text
+            self.canvas.itemconfig(self.text_item, text=new_text)
+            if self.tool:
+                self.tool.mark_as_changed()
+    
+    def select(self):
+        self.selected = True
+        self.canvas.itemconfig(self.shape_item, outline="red", width=3)
+    
+    def deselect(self):
+        self.selected = False
+        zoom_level = 1.0
+        if self.tool and hasattr(self.tool, 'zoom_level'):
+            zoom_level = self.tool.zoom_level
+        self.canvas.itemconfig(self.shape_item, outline="black", width=max(1, int(2 * zoom_level)))
+
+    def get_center(self):
+        zoom_level = self.tool.zoom_level if self.tool and hasattr(self.tool, 'zoom_level') else 1.0
+        return (self.x + (self.width * zoom_level) / 2, self.y + (self.height * zoom_level) / 2)
+
+    def delete(self):
+        self.canvas.delete(self.shape_item)
+        self.canvas.delete(self.text_item)
+
+class SequenceActor:
+    """Represents an actor/participant in a sequence diagram"""
+    def __init__(self, canvas, x, y, name="Actor", tool=None):
+        self.canvas = canvas
+        self.tool = tool
+        self.x = x
+        self.y = y
+        self.name = name
+        self.width = 80
+        self.height = 40
+        self.selected = False
+        self.drag_data = {"x": 0, "y": 0}
+        self.create_visual()
+    
+    def create_visual(self):
+        zoom_level = 1.0
+        if self.tool and hasattr(self.tool, 'zoom_level'):
+            zoom_level = self.tool.zoom_level
+        
+        if hasattr(self, 'box'):
+            self.canvas.delete(self.box)
+        if hasattr(self, 'text_item'):
+            self.canvas.delete(self.text_item)
+        if hasattr(self, 'lifeline'):
+            self.canvas.delete(self.lifeline)
+        
+        w = self.width * zoom_level
+        h = self.height * zoom_level
+        
+        # Draw actor box
+        self.box = self.canvas.create_rectangle(
+            self.x, self.y, self.x + w, self.y + h,
+            fill="lightblue", outline="black", width=max(1, int(2 * zoom_level))
+        )
+        
+        # Draw lifeline (dashed vertical line) - scale length with zoom
+        lifeline_length = 200 * zoom_level
+        self.lifeline = self.canvas.create_line(
+            self.x + w/2, self.y + h, self.x + w/2, self.y + h + lifeline_length,
+            fill="gray", width=max(1, int(1 * zoom_level)), dash=(5, 5)
+        )
+        
+        font_size = max(8, int(10 * zoom_level))
+        self.text_item = self.canvas.create_text(
+            self.x + w/2, self.y + h/2,
+            text=self.name,
+            font=("Arial", font_size, "bold"),
+            width=get_centered_text_width(w, 0.8),
+            justify="center"
+        )
+        
+        # Bind events to all items
+        for item in [self.box, self.text_item, self.lifeline]:
+            self.canvas.tag_bind(item, "<Button-1>", self.on_press)
+            self.canvas.tag_bind(item, "<B1-Motion>", self.on_drag)
+            self.canvas.tag_bind(item, "<ButtonRelease-1>", self.on_release)
+            self.canvas.tag_bind(item, "<Double-Button-1>", self.on_double_click)
+    
+    def on_press(self, event):
+        if self.tool and self.tool.is_panning:
+            return
+        self.drag_data["x"] = event.x
+        self.drag_data["y"] = event.y
+        if self.tool:
+            self.tool.deselect_all_visuals()
+            self.tool.selected_item = self
+            self.select()
+    
+    def on_drag(self, event):
+        if self.tool and self.tool.is_panning:
+            return
+        dx = event.x - self.drag_data["x"]
+        dy = 0
+        if dx != 0:
+            self._was_dragged = True
+        self.x += dx
+        self.drag_data["x"] = event.x
+        self.drag_data["y"] = event.y
+        self.canvas.move(self.box, dx, dy)
+        self.canvas.move(self.text_item, dx, dy)
+        self.canvas.move(self.lifeline, dx, dy)
+        if self.tool:
+            self.tool.update_relationships()
+    
+    def on_release(self, event):
+        if self.tool:
+            self.tool.update_scroll_region()
+            if hasattr(self, '_was_dragged') and self._was_dragged:
+                self.tool.mark_as_changed()
+                self._was_dragged = False
+            self.tool.save_positions()
+    
+    def on_double_click(self, event):
+        new_name = simpledialog.askstring("Edit Actor", "Enter actor name:", initialvalue=self.name)
+        if new_name:
+            self.name = new_name
+            self.canvas.itemconfig(self.text_item, text=new_name)
+            if self.tool:
+                self.tool.mark_as_changed()
+    
+    def select(self):
+        self.selected = True
+        zoom_level = 1.0
+        if self.tool and hasattr(self.tool, 'zoom_level'):
+            zoom_level = self.tool.zoom_level
+        self.canvas.itemconfig(self.box, outline="red", width=max(2, int(3 * zoom_level)))
+    
+    def deselect(self):
+        self.selected = False
+        zoom_level = 1.0
+        if self.tool and hasattr(self.tool, 'zoom_level'):
+            zoom_level = self.tool.zoom_level
+        self.canvas.itemconfig(self.box, outline="black", width=max(1, int(2 * zoom_level)))
+
+    def get_center(self):
+        zoom_level = self.tool.zoom_level if self.tool and hasattr(self.tool, 'zoom_level') else 1.0
+        return (self.x + (self.width * zoom_level) / 2, self.y + (self.height * zoom_level) / 2)
+
+    def delete(self):
+        self.canvas.delete(self.box)
+        self.canvas.delete(self.text_item)
+        self.canvas.delete(self.lifeline)
+
+class StateNode:
+    """Represents a state in a state diagram"""
+    def __init__(self, canvas, x, y, name="State", tool=None):
+        self.canvas = canvas
+        self.tool = tool
+        self.x = x
+        self.y = y
+        self.name = name
+        self.width = 100
+        self.height = 50
+        self.selected = False
+        self.drag_data = {"x": 0, "y": 0}
+        self.create_visual()
+    
+    def create_visual(self):
+        zoom_level = 1.0
+        if self.tool and hasattr(self.tool, 'zoom_level'):
+            zoom_level = self.tool.zoom_level
+        
+        if hasattr(self, 'box'):
+            self.canvas.delete(self.box)
+        if hasattr(self, 'text_item'):
+            self.canvas.delete(self.text_item)
+        
+        w = self.width * zoom_level
+        h = self.height * zoom_level
+        
+        # Draw rounded rectangle for state
+        self.box = self.canvas.create_rectangle(
+            self.x, self.y, self.x + w, self.y + h,
+            fill="lightgreen", outline="black", width=max(1, int(2 * zoom_level))
+        )
+        
+        font_size = max(8, int(10 * zoom_level))
+        self.text_item = self.canvas.create_text(
+            self.x + w/2, self.y + h/2,
+            text=self.name,
+            font=("Arial", font_size, "bold"),
+            width=get_centered_text_width(w, 0.8),
+            justify="center"
+        )
+        
+        # Bind events to all items
+        for item in [self.box, self.text_item]:
+            self.canvas.tag_bind(item, "<Button-1>", self.on_press)
+            self.canvas.tag_bind(item, "<B1-Motion>", self.on_drag)
+            self.canvas.tag_bind(item, "<ButtonRelease-1>", self.on_release)
+            self.canvas.tag_bind(item, "<Double-Button-1>", self.on_double_click)
+    
+    def on_press(self, event):
+        if self.tool and self.tool.is_panning:
+            return
+        self.drag_data["x"] = event.x
+        self.drag_data["y"] = event.y
+        if self.tool:
+            self.tool.deselect_all_visuals()
+            self.tool.selected_item = self
+            self.select()
+    
+    def on_drag(self, event):
+        if self.tool and self.tool.is_panning:
+            return
+        dx = event.x - self.drag_data["x"]
+        dy = event.y - self.drag_data["y"]
+        if dx != 0 or dy != 0:
+            self._was_dragged = True
+        self.x += dx
+        self.y += dy
+        self.drag_data["x"] = event.x
+        self.drag_data["y"] = event.y
+        self.canvas.move(self.box, dx, dy)
+        self.canvas.move(self.text_item, dx, dy)
+        if self.tool:
+            self.tool.update_relationships()
+    
+    def on_release(self, event):
+        if self.tool:
+            self.tool.update_scroll_region()
+            if hasattr(self, '_was_dragged') and self._was_dragged:
+                self.tool.mark_as_changed()
+                self._was_dragged = False
+            self.tool.save_positions()
+    
+    def on_double_click(self, event):
+        new_name = simpledialog.askstring("Edit State", "Enter state name:", initialvalue=self.name)
+        if new_name:
+            self.name = new_name
+            self.canvas.itemconfig(self.text_item, text=new_name)
+            if self.tool:
+                self.tool.mark_as_changed()
+    
+    def select(self):
+        self.selected = True
+        zoom_level = 1.0
+        if self.tool and hasattr(self.tool, 'zoom_level'):
+            zoom_level = self.tool.zoom_level
+        self.canvas.itemconfig(self.box, outline="red", width=max(2, int(3 * zoom_level)))
+    
+    def deselect(self):
+        self.selected = False
+        zoom_level = 1.0
+        if self.tool and hasattr(self.tool, 'zoom_level'):
+            zoom_level = self.tool.zoom_level
+        self.canvas.itemconfig(self.box, outline="black", width=max(1, int(2 * zoom_level)))
+
+    def get_center(self):
+        zoom_level = self.tool.zoom_level if self.tool and hasattr(self.tool, 'zoom_level') else 1.0
+        return (self.x + (self.width * zoom_level) / 2, self.y + (self.height * zoom_level) / 2)
+
+    def delete(self):
+        self.canvas.delete(self.box)
+        self.canvas.delete(self.text_item)
+
+class EREntity:
+    """Represents an entity in an ER diagram"""
+    def __init__(self, canvas, x, y, name="Entity", tool=None):
+        self.canvas = canvas
+        self.tool = tool
+        self.x = x
+        self.y = y
+        self.name = name
+        self.attributes = []
+        self.width = 120
+        self.height = 80
+        self.selected = False
+        self.drag_data = {"x": 0, "y": 0}
+        self.create_visual()
+    
+    def create_visual(self):
+        zoom_level = 1.0
+        if self.tool and hasattr(self.tool, 'zoom_level'):
+            zoom_level = self.tool.zoom_level
+        
+        if hasattr(self, 'box'):
+            self.canvas.delete(self.box)
+        if hasattr(self, 'text_item'):
+            self.canvas.delete(self.text_item)
+        
+        w = self.width * zoom_level
+        h = self.height * zoom_level
+        
+        # Draw entity box
+        self.box = self.canvas.create_rectangle(
+            self.x, self.y, self.x + w, self.y + h,
+            fill="lightyellow", outline="black", width=max(1, int(2 * zoom_level))
+        )
+        
+        font_size = max(8, int(10 * zoom_level))
+        self.text_item = self.canvas.create_text(
+            self.x + w/2, self.y + h/2,
+            text=self.name,
+            font=("Arial", font_size, "bold"),
+            width=get_centered_text_width(w, 0.8),
+            justify="center"
+        )
+        
+        # Bind events to all items
+        for item in [self.box, self.text_item]:
+            self.canvas.tag_bind(item, "<Button-1>", self.on_press)
+            self.canvas.tag_bind(item, "<B1-Motion>", self.on_drag)
+            self.canvas.tag_bind(item, "<ButtonRelease-1>", self.on_release)
+            self.canvas.tag_bind(item, "<Double-Button-1>", self.on_double_click)
+    
+    def on_press(self, event):
+        if self.tool and self.tool.is_panning:
+            return
+        self.drag_data["x"] = event.x
+        self.drag_data["y"] = event.y
+        if self.tool:
+            self.tool.deselect_all_visuals()
+            self.tool.selected_item = self
+            self.select()
+    
+    def on_drag(self, event):
+        if self.tool and self.tool.is_panning:
+            return
+        dx = event.x - self.drag_data["x"]
+        dy = event.y - self.drag_data["y"]
+        if dx != 0 or dy != 0:
+            self._was_dragged = True
+        self.x += dx
+        self.y += dy
+        self.drag_data["x"] = event.x
+        self.drag_data["y"] = event.y
+        self.canvas.move(self.box, dx, dy)
+        self.canvas.move(self.text_item, dx, dy)
+        if self.tool:
+            self.tool.update_relationships()
+    
+    def on_release(self, event):
+        if self.tool:
+            self.tool.update_scroll_region()
+            if hasattr(self, '_was_dragged') and self._was_dragged:
+                self.tool.mark_as_changed()
+                self._was_dragged = False
+            self.tool.save_positions()
+    
+    def on_double_click(self, event):
+        new_name = simpledialog.askstring("Edit Entity", "Enter entity name:", initialvalue=self.name)
+        if new_name:
+            self.name = new_name
+            self.canvas.itemconfig(self.text_item, text=new_name)
+            if self.tool:
+                self.tool.mark_as_changed()
+    
+    def select(self):
+        self.selected = True
+        zoom_level = 1.0
+        if self.tool and hasattr(self.tool, 'zoom_level'):
+            zoom_level = self.tool.zoom_level
+        self.canvas.itemconfig(self.box, outline="red", width=max(2, int(3 * zoom_level)))
+    
+    def deselect(self):
+        self.selected = False
+        zoom_level = 1.0
+        if self.tool and hasattr(self.tool, 'zoom_level'):
+            zoom_level = self.tool.zoom_level
+        self.canvas.itemconfig(self.box, outline="black", width=max(1, int(2 * zoom_level)))
+
+    def get_center(self):
+        zoom_level = self.tool.zoom_level if self.tool and hasattr(self.tool, 'zoom_level') else 1.0
+        return (self.x + (self.width * zoom_level) / 2, self.y + (self.height * zoom_level) / 2)
+
+    def delete(self):
+        self.canvas.delete(self.box)
+        self.canvas.delete(self.text_item)
+
+
+class FlowchartConnection:
+    def __init__(self, canvas, from_node, to_node, conn_type="arrow", label="", tool=None):
+        self.canvas = canvas
+        self.tool = tool
+        self.from_node = from_node
+        self.to_node = to_node
+        self.conn_type = conn_type
+        self.label = label
+        self.selected = False
+        self.line = None
+        self.label_text = None
+        self.create_visual()
+
+    def get_connection_points(self):
+        return self.from_node.get_center(), self.to_node.get_center()
+
+    def create_visual(self):
+        from_point, to_point = self.get_connection_points()
+        color = "red" if self.selected else "#2f3640"
+        zoom_level = self.tool.zoom_level if self.tool and hasattr(self.tool, 'zoom_level') else 1.0
+        width = max(1, int((3 if self.selected else 2) * zoom_level))
+        dash = None
+        arrow = None
+
+        if self.conn_type == "dotted":
+            dash = (6, 4)
+            arrow = tk.LAST
+        elif self.conn_type == "thick":
+            width = max(2, int((4 if self.selected else 3) * zoom_level))
+            arrow = tk.LAST
+        elif self.conn_type == "line":
+            arrow = None
+        else:
+            arrow = tk.LAST
+
+        self.line = self.canvas.create_line(
+            from_point[0], from_point[1], to_point[0], to_point[1],
+            fill=color, width=width, dash=dash, arrow=arrow
+        )
+        self.canvas.tag_lower(self.line)
+        if self.tool and self.canvas.find_withtag("grid"):
+            self.canvas.tag_raise(self.line, "grid")
+        self.canvas.tag_bind(self.line, "<Button-1>", self.on_click)
+        self.canvas.tag_bind(self.line, "<Double-Button-1>", self.on_double_click)
+
+        if self.label:
+            mid_x, mid_y = get_perpendicular_label_position(from_point, to_point, int(12 * zoom_level))
+            self.label_text = self.canvas.create_text(
+                mid_x, mid_y, text=self.label,
+                font=("Arial", max(8, int(9 * zoom_level))), fill="#0c2461"
+            )
+            place_text_near_line(
+                self.canvas,
+                self.label_text,
+                from_point,
+                to_point,
+                [
+                    self.canvas.bbox(self.from_node.shape_item),
+                    self.canvas.bbox(self.to_node.shape_item),
+                ],
+                preferred_side=1,
+                base_offset=int(12 * zoom_level),
+                padding=2,
+            )
+            self.canvas.tag_lower(self.label_text)
+            self.canvas.tag_bind(self.label_text, "<Button-1>", self.on_click)
+            self.canvas.tag_bind(self.label_text, "<Double-Button-1>", self.on_double_click)
+
+    def update_position(self):
+        self.delete()
+        self.create_visual()
+
+    def on_click(self, event):
+        if self.tool:
+            self.tool.deselect_all_visuals()
+        self.select()
+        return "break"
+
+    def on_double_click(self, event):
+        new_label = simpledialog.askstring("Connection Label", "Enter connection label:", initialvalue=self.label)
+        if new_label is not None:
+            self.label = new_label
+            self.update_position()
+            if self.tool:
+                self.tool.mark_as_changed()
+        return "break"
+
+    def select(self):
+        self.selected = True
+        self.update_position()
+        if self.tool:
+            self.tool.update_status(f"Selected flowchart connection: {self.from_node.node_id} -> {self.to_node.node_id}")
+
+    def deselect(self):
+        self.selected = False
+        self.update_position()
+
+    def delete(self):
+        if self.line:
+            self.canvas.delete(self.line)
+        if self.label_text:
+            self.canvas.delete(self.label_text)
+        self.line = None
+        self.label_text = None
+
+
+class SequenceMessage:
+    def __init__(self, canvas, from_actor, to_actor, msg_type="sync", label="", index=0, tool=None):
+        self.canvas = canvas
+        self.tool = tool
+        self.from_actor = from_actor
+        self.to_actor = to_actor
+        self.msg_type = msg_type
+        self.label = label or "message"
+        self.index = index
+        self.selected = False
+        self.line = None
+        self.label_text = None
+        self.create_visual()
+
+    def get_y(self):
+        zoom_level = self.tool.zoom_level if self.tool and hasattr(self.tool, 'zoom_level') else 1.0
+        top = max(self.from_actor.y + self.from_actor.height * zoom_level, self.to_actor.y + self.to_actor.height * zoom_level)
+        return top + ((self.index + 1) * 50 * zoom_level)
+
+    def create_visual(self):
+        zoom_level = self.tool.zoom_level if self.tool and hasattr(self.tool, 'zoom_level') else 1.0
+        from_x = self.from_actor.get_center()[0]
+        to_x = self.to_actor.get_center()[0]
+        y = self.get_y()
+        color = "red" if self.selected else "#2d3436"
+        width = max(1, int((3 if self.selected else 2) * zoom_level))
+        dash = None
+        arrow = tk.LAST
+
+        if self.msg_type == "return":
+            dash = (6, 4)
+        elif self.msg_type == "note":
+            dash = (2, 4)
+            arrow = None
+        elif self.msg_type == "async":
+            arrow = tk.LAST
+
+        self.line = self.canvas.create_line(from_x, y, to_x, y, fill=color, width=width, dash=dash, arrow=arrow)
+        self.canvas.tag_lower(self.line)
+        if self.tool and self.canvas.find_withtag("grid"):
+            self.canvas.tag_raise(self.line, "grid")
+        self.canvas.tag_bind(self.line, "<Button-1>", self.on_click)
+        self.canvas.tag_bind(self.line, "<Double-Button-1>", self.on_double_click)
+
+        label_fill = "#6c5ce7" if self.msg_type != "note" else "#b9770e"
+        self.label_text = self.canvas.create_text(
+            (from_x + to_x) / 2, y - (12 * zoom_level), text=self.label,
+            font=("Arial", max(8, int(9 * zoom_level))), fill=label_fill
+        )
+        self.canvas.tag_lower(self.label_text)
+        self.canvas.tag_bind(self.label_text, "<Button-1>", self.on_click)
+        self.canvas.tag_bind(self.label_text, "<Double-Button-1>", self.on_double_click)
+
+    def update_position(self):
+        self.delete()
+        self.create_visual()
+
+    def on_click(self, event):
+        if self.tool:
+            self.tool.deselect_all_visuals()
+        self.select()
+        return "break"
+
+    def on_double_click(self, event):
+        new_label = simpledialog.askstring("Message Label", "Enter message label:", initialvalue=self.label)
+        if new_label is not None:
+            self.label = new_label
+            self.update_position()
+            if self.tool:
+                self.tool.mark_as_changed()
+        return "break"
+
+    def select(self):
+        self.selected = True
+        self.update_position()
+        if self.tool:
+            self.tool.update_status(f"Selected sequence message: {self.from_actor.name} -> {self.to_actor.name}")
+
+    def deselect(self):
+        self.selected = False
+        self.update_position()
+
+    def delete(self):
+        if self.line:
+            self.canvas.delete(self.line)
+        if self.label_text:
+            self.canvas.delete(self.label_text)
+        self.line = None
+        self.label_text = None
+
+
+class StateTransition:
+    def __init__(self, canvas, from_state, to_state, label="", tool=None):
+        self.canvas = canvas
+        self.tool = tool
+        self.from_state = from_state
+        self.to_state = to_state
+        self.label = label
+        self.selected = False
+        self.line = None
+        self.label_text = None
+        self.create_visual()
+
+    def get_label_side(self):
+        """Split labels for reverse transitions onto opposite sides of the shared path."""
+        from_name = getattr(self.from_state, "name", "")
+        to_name = getattr(self.to_state, "name", "")
+        return 1 if from_name <= to_name else -1
+
+    def create_visual(self):
+        zoom_level = self.tool.zoom_level if self.tool and hasattr(self.tool, 'zoom_level') else 1.0
+        from_point = self.from_state.get_center()
+        to_point = self.to_state.get_center()
+        color = "red" if self.selected else "#1e8449"
+        width = max(1, int((3 if self.selected else 2) * zoom_level))
+
+        self.line = self.canvas.create_line(
+            from_point[0], from_point[1], to_point[0], to_point[1],
+            fill=color, width=width, arrow=tk.LAST, smooth=True
+        )
+        self.canvas.tag_lower(self.line)
+        if self.tool and self.canvas.find_withtag("grid"):
+            self.canvas.tag_raise(self.line, "grid")
+        self.canvas.tag_bind(self.line, "<Button-1>", self.on_click)
+        self.canvas.tag_bind(self.line, "<Double-Button-1>", self.on_double_click)
+
+        if self.label:
+            label_side = self.get_label_side()
+            label_x, label_y = get_perpendicular_label_position(
+                from_point, to_point, int(12 * zoom_level), side=label_side
+            )
+            self.label_text = self.canvas.create_text(
+                label_x,
+                label_y,
+                text=self.label,
+                font=("Arial", max(8, int(9 * zoom_level))), fill="#145a32"
+            )
+            place_text_near_line(
+                self.canvas,
+                self.label_text,
+                from_point,
+                to_point,
+                [
+                    self.canvas.bbox(state.box)
+                    for state in self.tool.state_nodes
+                ] if self.tool else [
+                    self.canvas.bbox(self.from_state.box),
+                    self.canvas.bbox(self.to_state.box),
+                ],
+                preferred_side=label_side,
+                base_offset=int(12 * zoom_level),
+                padding=2,
+            )
+            self.canvas.tag_lower(self.label_text)
+            self.canvas.tag_bind(self.label_text, "<Button-1>", self.on_click)
+            self.canvas.tag_bind(self.label_text, "<Double-Button-1>", self.on_double_click)
+
+    def update_position(self):
+        self.delete()
+        self.create_visual()
+
+    def on_click(self, event):
+        if self.tool:
+            self.tool.deselect_all_visuals()
+        self.select()
+        return "break"
+
+    def on_double_click(self, event):
+        new_label = simpledialog.askstring("Transition Label", "Enter transition label:", initialvalue=self.label)
+        if new_label is not None:
+            self.label = new_label
+            self.update_position()
+            if self.tool:
+                self.tool.mark_as_changed()
+        return "break"
+
+    def select(self):
+        self.selected = True
+        self.update_position()
+        if self.tool:
+            self.tool.update_status(f"Selected state transition: {self.from_state.name} -> {self.to_state.name}")
+
+    def deselect(self):
+        self.selected = False
+        self.update_position()
+
+    def delete(self):
+        if self.line:
+            self.canvas.delete(self.line)
+        if self.label_text:
+            self.canvas.delete(self.label_text)
+        self.line = None
+        self.label_text = None
+
+
+class ERRelationship:
+    def __init__(self, canvas, from_entity, to_entity, rel_type="one-to-many", label="", tool=None):
+        self.canvas = canvas
+        self.tool = tool
+        self.from_entity = from_entity
+        self.to_entity = to_entity
+        self.rel_type = rel_type
+        self.label = label
+        self.selected = False
+        self.line = None
+        self.label_text = None
+        self.from_card_text = None
+        self.to_card_text = None
+        self.create_visual()
+
+    def cardinalities(self):
+        if self.rel_type == "one-to-one":
+            return "1", "1"
+        if self.rel_type == "many-to-many":
+            return "N", "N"
+        return "1", "N"
+
+    def create_visual(self):
+        zoom_level = self.tool.zoom_level if self.tool and hasattr(self.tool, 'zoom_level') else 1.0
+        from_rect = {
+            'left': self.from_entity.x,
+            'right': self.from_entity.x + (self.from_entity.width * zoom_level),
+            'top': self.from_entity.y,
+            'bottom': self.from_entity.y + (self.from_entity.height * zoom_level)
+        }
+        to_rect = {
+            'left': self.to_entity.x,
+            'right': self.to_entity.x + (self.to_entity.width * zoom_level),
+            'top': self.to_entity.y,
+            'bottom': self.to_entity.y + (self.to_entity.height * zoom_level)
+        }
+        from_point, to_point = get_box_connection_points(from_rect, to_rect)
+        color = "red" if self.selected else "#8e5a2b"
+        width = max(1, int((3 if self.selected else 2) * zoom_level))
+
+        self.line = self.canvas.create_line(
+            from_point[0], from_point[1], to_point[0], to_point[1],
+            fill=color, width=width
+        )
+        self.canvas.tag_lower(self.line)
+        if self.tool and self.canvas.find_withtag("grid"):
+            self.canvas.tag_raise(self.line, "grid")
+        self.canvas.tag_bind(self.line, "<Button-1>", self.on_click)
+        self.canvas.tag_bind(self.line, "<Double-Button-1>", self.on_double_click)
+
+        from_card, to_card = self.cardinalities()
+        from_card_x, from_card_y = get_outside_box_label_position(
+            self.from_entity.get_center(), from_point, to_point, int(18 * zoom_level), int(10 * zoom_level)
+        )
+        to_card_x, to_card_y = get_outside_box_label_position(
+            self.to_entity.get_center(), to_point, from_point, int(18 * zoom_level), int(10 * zoom_level)
+        )
+        self.from_card_text = self.canvas.create_text(
+            from_card_x, from_card_y,
+            text=from_card, font=("Arial", max(8, int(9 * zoom_level)), "bold"), fill="#784212"
+        )
+        self.to_card_text = self.canvas.create_text(
+            to_card_x, to_card_y,
+            text=to_card, font=("Arial", max(8, int(9 * zoom_level)), "bold"), fill="#784212"
+        )
+        for item in [self.from_card_text, self.to_card_text]:
+            self.canvas.tag_raise(item)
+            self.canvas.tag_bind(item, "<Button-1>", self.on_click)
+            self.canvas.tag_bind(item, "<Double-Button-1>", self.on_double_click)
+
+        if self.label:
+            label_x, label_y = get_perpendicular_label_position(from_point, to_point, int(12 * zoom_level))
+            self.label_text = self.canvas.create_text(
+                label_x,
+                label_y,
+                text=self.label,
+                font=("Arial", max(8, int(9 * zoom_level))), fill="#935116"
+            )
+            place_text_near_line(
+                self.canvas,
+                self.label_text,
+                from_point,
+                to_point,
+                [
+                    self.canvas.bbox(entity.box)
+                    for entity in self.tool.er_entities
+                ] if self.tool else [
+                    self.canvas.bbox(self.from_entity.box),
+                    self.canvas.bbox(self.to_entity.box),
+                ],
+                preferred_side=1,
+                base_offset=int(12 * zoom_level),
+                padding=2,
+            )
+            self.canvas.tag_raise(self.label_text)
+            self.canvas.tag_bind(self.label_text, "<Button-1>", self.on_click)
+            self.canvas.tag_bind(self.label_text, "<Double-Button-1>", self.on_double_click)
+
+    def update_position(self):
+        self.delete()
+        self.create_visual()
+
+    def on_click(self, event):
+        if self.tool:
+            self.tool.deselect_all_visuals()
+        self.select()
+        return "break"
+
+    def on_double_click(self, event):
+        new_label = simpledialog.askstring("Relationship Label", "Enter relationship label:", initialvalue=self.label)
+        if new_label is not None:
+            self.label = new_label
+            self.update_position()
+            if self.tool:
+                self.tool.mark_as_changed()
+        return "break"
+
+    def select(self):
+        self.selected = True
+        self.update_position()
+        if self.tool:
+            self.tool.update_status(f"Selected ER relationship: {self.from_entity.name} -> {self.to_entity.name}")
+
+    def deselect(self):
+        self.selected = False
+        self.update_position()
+
+    def delete(self):
+        for item_name in ["line", "label_text", "from_card_text", "to_card_text"]:
+            item = getattr(self, item_name, None)
+            if item:
+                self.canvas.delete(item)
+                setattr(self, item_name, None)
+
 class MermaidDiagramTool:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Mermaid UML Class Diagram Tool")
-        self.root.geometry("1200x800")
+        self.root.title("Mermaid Diagram Tool")
+        self.root.geometry("1440x900")
+        self.root.minsize(1280, 780)
         
+        self.diagram_type = "classDiagram"  # or "flowchart", "sequenceDiagram", "stateDiagram", "erDiagram"
         self.classes = []
+        self.flowchart_nodes = []  # For flowchart mode
+        self.flowchart_connections = []
+        self.sequence_actors = []  # For sequence diagram
+        self.sequence_messages = []  # For sequence diagram
+        self.state_nodes = []  # For state diagram
+        self.state_transitions = []  # For state diagram
+        self.er_entities = []  # For ER diagram
+        self.er_relationships = []  # For ER diagram
         self.relationships = []
         self.selected_class = None
+        self.selected_node = None  # For flowchart mode
+        self.selected_item = None  # Generic selection for other diagram types
         self.relationship_mode = False
         self.relationship_type = "association"
         self.relationship_start = None
@@ -1354,8 +2577,10 @@ class MermaidDiagramTool:
         self.has_unsaved_changes = False
         self.current_file = None
         self.config_file = "mermaid_tool_config.txt"
+        self.debug_logging = False
         
         self.create_widgets()
+        self.update_diagram_type_ui()
         
         # Set up window close handler
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -1364,6 +2589,9 @@ class MermaidDiagramTool:
         self.load_last_diagram()
         
     def create_widgets(self):
+        self.root.configure(bg="#f3f6fb")
+        self.configure_ttk_styles()
+
         # Menu bar
         menubar = tk.Menu(self.root)
         self.root.config(menu=menubar)
@@ -1374,49 +2602,410 @@ class MermaidDiagramTool:
         file_menu.add_command(label="Open Mermaid", command=self.open_mermaid)
         file_menu.add_command(label="Save Mermaid", command=self.save_mermaid)
         
-        # Toolbar
-        toolbar = tk.Frame(self.root, bg="lightgray", height=50)
-        toolbar.pack(side=tk.TOP, fill=tk.X)
-        
-        tk.Button(toolbar, text="Add Class", command=self.add_class).pack(side=tk.LEFT, padx=5, pady=5)
-        tk.Button(toolbar, text="Delete Selected", command=self.delete_selected).pack(side=tk.LEFT, padx=5, pady=5)
-        tk.Button(toolbar, text="Auto Layout", command=self.apply_hierarchical_layout, bg="lightgreen").pack(side=tk.LEFT, padx=5, pady=5)
-        
-        tk.Label(toolbar, text="Relationship:", bg="lightgray").pack(side=tk.LEFT, padx=(20, 5), pady=5)
-        
+        app_shell = tk.Frame(self.root, bg="#f3f6fb")
+        app_shell.pack(fill=tk.BOTH, expand=True, padx=14, pady=14)
+
+        header = tk.Frame(app_shell, bg="#f3f6fb")
+        header.pack(fill=tk.X, pady=(0, 12))
+
+        brand_frame = tk.Frame(header, bg="#f3f6fb")
+        brand_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(
+            brand_frame,
+            text="Mermaid Diagram Studio",
+            bg="#f3f6fb",
+            fg="#132238",
+            font=("Segoe UI Semibold", 16),
+        ).pack(anchor=tk.W)
+        tk.Label(
+            brand_frame,
+            text="Visual editing with live Mermaid output, modeled after the code-plus-preview rhythm of the official Mermaid editors.",
+            bg="#f3f6fb",
+            fg="#5b6b80",
+            font=("Segoe UI", 9),
+            wraplength=700,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(2, 0))
+
+        document_card = tk.Frame(
+            header,
+            bg="#ffffff",
+            highlightthickness=1,
+            highlightbackground="#d8e1ed",
+            padx=14,
+            pady=10,
+        )
+        document_card.pack(side=tk.RIGHT, padx=(16, 0))
+        tk.Label(
+            document_card,
+            text="Current file",
+            bg="#ffffff",
+            fg="#66758a",
+            font=("Segoe UI", 8, "bold"),
+        ).pack(anchor=tk.W)
+        self.document_label = tk.Label(
+            document_card,
+            text="Untitled diagram",
+            bg="#ffffff",
+            fg="#132238",
+            font=("Segoe UI Semibold", 10),
+        )
+        self.document_label.pack(anchor=tk.W, pady=(2, 0))
+        self.document_meta_label = tk.Label(
+            document_card,
+            text="Saved",
+            bg="#ffffff",
+            fg="#4b6584",
+            font=("Segoe UI", 8),
+        )
+        self.document_meta_label.pack(anchor=tk.W, pady=(2, 0))
+
+        toolbar = tk.Frame(
+            app_shell,
+            bg="#ffffff",
+            highlightthickness=1,
+            highlightbackground="#d8e1ed",
+            padx=12,
+            pady=12,
+        )
+        toolbar.pack(fill=tk.X, pady=(0, 12))
+        self.toolbar = toolbar
+
+        file_tools = self.create_control_group(toolbar, "Diagram")
+        mode_tools = self.create_control_group(toolbar, "Edit")
+        connector_tools = self.create_control_group(toolbar, "Connector")
+        zoom_tools = self.create_control_group(toolbar, "View")
+
+        self.diagram_type_var = tk.StringVar(value="classDiagram")
+        type_combo = ttk.Combobox(
+            file_tools,
+            textvariable=self.diagram_type_var,
+            values=["classDiagram", "flowchart", "sequenceDiagram", "stateDiagram", "erDiagram"],
+            state="readonly",
+            width=14,
+            style="Friendly.TCombobox",
+        )
+        type_combo.pack(side=tk.LEFT, padx=(0, 8), pady=2)
+        type_combo.bind("<<ComboboxSelected>>", self.on_diagram_type_changed)
+
+        self.new_button = tk.Button(file_tools, text="New", command=self.new_diagram, width=7)
+        self.new_button.pack(side=tk.LEFT, padx=3, pady=2)
+        self.open_button = tk.Button(file_tools, text="Open", command=self.open_mermaid, width=7)
+        self.open_button.pack(side=tk.LEFT, padx=3, pady=2)
+        self.save_button = tk.Button(file_tools, text="Save", command=self.save_mermaid, width=7)
+        self.save_button.pack(side=tk.LEFT, padx=3, pady=2)
+
+        self.add_button = tk.Button(mode_tools, text="Add Class", command=self.add_primary_element, width=11)
+        self.add_button.pack(side=tk.LEFT, padx=3, pady=2)
+        self.delete_button = tk.Button(mode_tools, text="Delete", command=self.delete_selected, width=10)
+        self.delete_button.pack(side=tk.LEFT, padx=3, pady=2)
+        self.layout_button = tk.Button(mode_tools, text="Layout", command=self.apply_hierarchical_layout, width=9)
+        self.layout_button.pack(side=tk.LEFT, padx=3, pady=2)
+
+        self.connection_label = tk.Label(
+            connector_tools,
+            text="Connector:",
+            bg="#f7f9fc",
+            fg="#243447",
+            font=("Segoe UI", 9, "bold"),
+        )
+        self.connection_label.pack(side=tk.LEFT, padx=(0, 6), pady=2)
+
         self.rel_type_var = tk.StringVar(value="association")
-        rel_combo = ttk.Combobox(toolbar, textvariable=self.rel_type_var, 
-                                values=["association", "inheritance", "composition", "aggregation", "dependency", "realization"],
-                                state="readonly", width=15)
-        rel_combo.pack(side=tk.LEFT, padx=5, pady=5)
+        rel_combo = ttk.Combobox(
+            connector_tools,
+            textvariable=self.rel_type_var,
+            values=["association", "inheritance", "composition", "aggregation", "dependency", "realization"],
+            state="readonly",
+            width=14,
+            style="Friendly.TCombobox",
+        )
+        rel_combo.pack(side=tk.LEFT, padx=(0, 8), pady=2)
+        rel_combo.bind("<<ComboboxSelected>>", self.on_relationship_type_changed)
+        self.rel_combo = rel_combo
+
+        self.rel_button = tk.Button(connector_tools, text="Draw", command=self.toggle_relationship_mode, width=9)
+        self.rel_button.pack(side=tk.LEFT, padx=3, pady=2)
+
+        tk.Label(
+            zoom_tools,
+            text="Zoom",
+            bg="#f7f9fc",
+            fg="#243447",
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side=tk.LEFT, padx=(0, 6), pady=2)
+        self.zoom_out_button = tk.Button(zoom_tools, text="-", command=self.zoom_out, width=3)
+        self.zoom_out_button.pack(side=tk.LEFT, padx=2, pady=2)
+        self.zoom_label = tk.Label(
+            zoom_tools,
+            text="100%",
+            bg="#f7f9fc",
+            width=4,
+            fg="#243447",
+            font=("Segoe UI Semibold", 9),
+        )
+        self.zoom_label.pack(side=tk.LEFT, padx=2, pady=2)
+        self.zoom_in_button = tk.Button(zoom_tools, text="+", command=self.zoom_in, width=3)
+        self.zoom_in_button.pack(side=tk.LEFT, padx=2, pady=2)
+        self.zoom_reset_button = tk.Button(zoom_tools, text="1:1", command=self.zoom_reset, width=4)
+        self.zoom_reset_button.pack(side=tk.LEFT, padx=(2, 8), pady=2)
+
+        self.show_grid = tk.BooleanVar(value=False)
+        self.grid_check = tk.Checkbutton(
+            zoom_tools,
+            text="Grid",
+            variable=self.show_grid,
+            command=self.toggle_grid,
+            bg="#f7f9fc",
+            activebackground="#f7f9fc",
+            fg="#243447",
+            font=("Segoe UI", 9),
+            cursor="hand2",
+        )
+        self.grid_check.pack(side=tk.LEFT, padx=(0, 2), pady=2)
+
+        summary_card = tk.Frame(
+            app_shell,
+            bg="#ffffff",
+            highlightthickness=1,
+            highlightbackground="#d8e1ed",
+            padx=14,
+            pady=10,
+        )
+        summary_card.pack(fill=tk.X, pady=(0, 12))
+        self.summary_label = tk.Label(
+            summary_card,
+            text="",
+            bg="#ffffff",
+            fg="#17324d",
+            anchor=tk.W,
+            font=("Segoe UI Semibold", 10),
+        )
+        self.summary_label.pack(side=tk.TOP, fill=tk.X)
+        self.mode_hint_label = tk.Label(
+            summary_card,
+            text="",
+            bg="#ffffff",
+            fg="#607186",
+            anchor=tk.W,
+            font=("Segoe UI", 9),
+            wraplength=1200,
+            justify=tk.LEFT,
+        )
+        self.mode_hint_label.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
+
+        content_frame = tk.Frame(app_shell, bg="#f3f6fb")
+        content_frame.pack(fill=tk.BOTH, expand=True)
+
+        palette_shell = tk.Frame(
+            content_frame,
+            bg="#ffffff",
+            width=198,
+            highlightthickness=1,
+            highlightbackground="#d8e1ed",
+        )
+        palette_shell.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 12))
+        palette_shell.pack_propagate(False)
+        tk.Label(
+            palette_shell,
+            text="Tools",
+            bg="#ffffff",
+            fg="#132238",
+            font=("Segoe UI Semibold", 11),
+        ).pack(anchor=tk.W, padx=14, pady=(14, 2))
+        tk.Label(
+            palette_shell,
+            text="Pick shapes or relationships, then place them on the canvas.",
+            bg="#ffffff",
+            fg="#647488",
+            font=("Segoe UI", 8),
+            wraplength=166,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, padx=14, pady=(0, 10))
+
+        self.shape_palette = tk.Frame(palette_shell, bg="#ffffff", bd=0, highlightthickness=0)
+        self.shape_palette.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.create_shape_palette()
+
+        center_column = tk.Frame(content_frame, bg="#f3f6fb")
+        center_column.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        canvas_card = tk.Frame(
+            center_column,
+            bg="#ffffff",
+            highlightthickness=1,
+            highlightbackground="#d8e1ed",
+        )
+        canvas_card.pack(fill=tk.BOTH, expand=True)
+
+        canvas_header = tk.Frame(canvas_card, bg="#ffffff")
+        canvas_header.pack(fill=tk.X, padx=14, pady=(14, 8))
+        self.canvas_title_label = tk.Label(
+            canvas_header,
+            text="Canvas",
+            bg="#ffffff",
+            fg="#132238",
+            font=("Segoe UI Semibold", 12),
+        )
+        self.canvas_title_label.pack(side=tk.LEFT)
+        self.canvas_meta_label = tk.Label(
+            canvas_header,
+            text="",
+            bg="#ffffff",
+            fg="#5f7084",
+            font=("Segoe UI", 9),
+        )
+        self.canvas_meta_label.pack(side=tk.RIGHT)
+
+        self.info_banner = tk.Label(
+            canvas_card,
+            text="",
+            bg="#eef5ff",
+            fg="#1e3a5f",
+            anchor=tk.W,
+            padx=12,
+            pady=9,
+            relief=tk.FLAT,
+            bd=0,
+        )
+        self.info_banner.pack(fill=tk.X, padx=14)
+
+        canvas_frame = tk.Frame(canvas_card, bg="#ffffff")
+        canvas_frame.pack(fill=tk.BOTH, expand=True, padx=14, pady=14)
         
-        self.rel_button = tk.Button(toolbar, text="Add Relationship", 
-                                   command=self.toggle_relationship_mode)
-        self.rel_button.pack(side=tk.LEFT, padx=5, pady=5)
-        
-        # Zoom controls
-        tk.Label(toolbar, text="Zoom:", bg="lightgray").pack(side=tk.LEFT, padx=(20, 5), pady=5)
-        tk.Button(toolbar, text="-", command=self.zoom_out, width=2).pack(side=tk.LEFT, padx=2, pady=5)
-        self.zoom_label = tk.Label(toolbar, text="100%", bg="lightgray", width=6)
-        self.zoom_label.pack(side=tk.LEFT, padx=2, pady=5)
-        tk.Button(toolbar, text="+", command=self.zoom_in, width=2).pack(side=tk.LEFT, padx=2, pady=5)
-        tk.Button(toolbar, text="Reset", command=self.zoom_reset, width=5).pack(side=tk.LEFT, padx=5, pady=5)
-        
-        # Canvas
-        canvas_frame = tk.Frame(self.root)
-        canvas_frame.pack(fill=tk.BOTH, expand=True)
-        
-        self.canvas = tk.Canvas(canvas_frame, bg="white")
+        self.canvas = tk.Canvas(canvas_frame, bg="#fbfdff", highlightthickness=0)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
-        # Scrollbars
-        v_scrollbar = tk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=self.canvas.yview)
+        v_scrollbar = tk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=self.on_v_scroll)
         v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.canvas.configure(yscrollcommand=v_scrollbar.set)
-        
-        h_scrollbar = tk.Scrollbar(self.root, orient=tk.HORIZONTAL, command=self.canvas.xview)
-        h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
-        self.canvas.configure(xscrollcommand=h_scrollbar.set)
+        self.canvas.configure(yscrollcommand=self.on_canvas_y_scroll)
+
+        h_scrollbar = tk.Scrollbar(canvas_card, orient=tk.HORIZONTAL, command=self.on_h_scroll)
+        h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X, padx=14, pady=(0, 14))
+        self.canvas.configure(xscrollcommand=self.on_canvas_x_scroll)
+
+        self.v_scrollbar = v_scrollbar
+        self.h_scrollbar = h_scrollbar
+
+        preview_panel = tk.Frame(
+            content_frame,
+            bg="#ffffff",
+            width=350,
+            highlightthickness=1,
+            highlightbackground="#d8e1ed",
+        )
+        preview_panel.pack(side=tk.RIGHT, fill=tk.Y, padx=(12, 0))
+        preview_panel.pack_propagate(False)
+
+        tk.Label(
+            preview_panel,
+            text="Live Mermaid",
+            bg="#ffffff",
+            fg="#132238",
+            font=("Segoe UI Semibold", 11),
+        ).pack(anchor=tk.W, padx=14, pady=(14, 2))
+        tk.Label(
+            preview_panel,
+            text="The official Mermaid Live Editor keeps code next to preview. This pane mirrors that workflow while you edit visually.",
+            bg="#ffffff",
+            fg="#647488",
+            font=("Segoe UI", 8),
+            wraplength=310,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, padx=14, pady=(0, 10))
+
+        action_row = tk.Frame(preview_panel, bg="#ffffff")
+        action_row.pack(fill=tk.X, padx=14, pady=(0, 10))
+        self.copy_code_button = tk.Button(action_row, text="Copy Code", command=self.copy_mermaid_code, width=11)
+        self.copy_code_button.pack(side=tk.LEFT, padx=(0, 6))
+        self.refresh_code_button = tk.Button(action_row, text="Refresh", command=self.refresh_code_preview, width=9)
+        self.refresh_code_button.pack(side=tk.LEFT)
+
+        self.code_meta_label = tk.Label(
+            preview_panel,
+            text="",
+            bg="#ffffff",
+            fg="#4c647d",
+            font=("Segoe UI", 8),
+        )
+        self.code_meta_label.pack(anchor=tk.W, padx=14, pady=(0, 6))
+
+        code_frame = tk.Frame(preview_panel, bg="#ffffff")
+        code_frame.pack(fill=tk.BOTH, expand=True, padx=14)
+        code_scroll = tk.Scrollbar(code_frame, orient=tk.VERTICAL)
+        code_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        code_x_scroll = tk.Scrollbar(code_frame, orient=tk.HORIZONTAL)
+        code_x_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+        self.code_preview = tk.Text(
+            code_frame,
+            wrap=tk.NONE,
+            state=tk.DISABLED,
+            bg="#0f1724",
+            fg="#dfe8f3",
+            insertbackground="#dfe8f3",
+            font=("Consolas", 10),
+            padx=10,
+            pady=10,
+            relief=tk.FLAT,
+            bd=0,
+            yscrollcommand=code_scroll.set,
+            xscrollcommand=code_x_scroll.set,
+        )
+        self.code_preview.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        code_scroll.config(command=self.code_preview.yview)
+        code_x_scroll.config(command=self.code_preview.xview)
+
+        samples_panel = tk.Frame(
+            preview_panel,
+            bg="#f7f9fc",
+            highlightthickness=1,
+            highlightbackground="#dfe7f2",
+            padx=12,
+            pady=12,
+        )
+        samples_panel.pack(fill=tk.X, padx=14, pady=(0, 10), before=code_frame)
+        tk.Label(
+            samples_panel,
+            text="Sample diagrams",
+            bg="#f7f9fc",
+            fg="#132238",
+            font=("Segoe UI Semibold", 10),
+        ).pack(anchor=tk.W)
+        tk.Label(
+            samples_panel,
+            text="Mermaid Live Editor ships sample diagrams. These local files give this desktop tool the same fast starting point.",
+            bg="#f7f9fc",
+            fg="#647488",
+            font=("Segoe UI", 8),
+            wraplength=286,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(4, 8))
+        self.sample_map = {
+            "Class sample": "sample_class_diagram.md",
+            "Flowchart sample": "sample_flowchart.md",
+            "Sequence sample": "sample_sequence_diagram.md",
+            "State sample": "sample_state_diagram.md",
+            "ER sample": "sample_er_diagram.md",
+        }
+        sample_picker_row = tk.Frame(samples_panel, bg="#f7f9fc")
+        sample_picker_row.pack(fill=tk.X)
+        self.sample_choice_var = tk.StringVar(value="Class sample")
+        self.sample_combo = ttk.Combobox(
+            sample_picker_row,
+            textvariable=self.sample_choice_var,
+            values=list(self.sample_map.keys()),
+            state="readonly",
+            width=18,
+            style="Friendly.TCombobox",
+        )
+        self.sample_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        self.sample_load_button = tk.Button(
+            sample_picker_row,
+            text="Load",
+            command=self.load_selected_sample,
+            width=8,
+        )
+        self.sample_load_button.pack(side=tk.RIGHT)
         
         # Configure scroll region
         self.canvas.configure(scrollregion=(0, 0, 2000, 2000))
@@ -1429,37 +3018,789 @@ class MermaidDiagramTool:
         self.canvas.bind("<Button-3>", self.canvas_right_click)  # Right-click for class creation
         self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)  # Mouse wheel for zooming
         self.canvas.bind("<Motion>", self.canvas_motion)  # Track mouse movement for cursor changes
+        self.canvas.bind("<Configure>", self.on_canvas_configure)  # Redraw grid on resize/scroll
         
         # Status bar
-        self.status_bar = tk.Label(self.root, text="Ready", bd=1, relief=tk.SUNKEN, anchor=tk.W)
-        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        self.status_bar = tk.Label(
+            app_shell,
+            text="Ready",
+            bd=0,
+            relief=tk.FLAT,
+            anchor=tk.W,
+            bg="#e8eef7",
+            fg="#30465f",
+            padx=12,
+            pady=7,
+            font=("Segoe UI", 9),
+        )
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X, pady=(12, 0))
         
         # Bind keyboard events
         self.root.bind("<Key>", self.on_key_press)
         self.root.focus_set()  # Make sure root can receive key events
+        self.current_status_message = "Ready"
+        self.apply_button_styles()
+        self.refresh_ui_feedback()
+
+    def create_control_group(self, parent, title):
+        frame = tk.Frame(
+            parent,
+            bg="#f7f9fc",
+            highlightthickness=1,
+            highlightbackground="#dfe7f2",
+            padx=10,
+            pady=8,
+        )
+        frame.pack(side=tk.LEFT, padx=(0, 10))
+        tk.Label(
+            frame,
+            text=title,
+            bg="#f7f9fc",
+            fg="#617386",
+            font=("Segoe UI", 8, "bold"),
+        ).pack(anchor=tk.W, pady=(0, 6))
+        body = tk.Frame(frame, bg="#f7f9fc")
+        body.pack(anchor=tk.W)
+        return body
+    
+    def create_shape_palette(self):
+        """Create the shape palette with visual buttons"""
+        # Container for palette content that can be switched
+        self.palette_content = tk.Frame(self.shape_palette, bg="#ffffff")
+        self.palette_content.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         
+        # Initially create flowchart palette (will be hidden)
+        self.create_flowchart_palette()
+
+    def configure_ttk_styles(self):
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure(
+            "Friendly.TCombobox",
+            fieldbackground="#ffffff",
+            background="#ffffff",
+            bordercolor="#c6d3e1",
+            lightcolor="#c6d3e1",
+            darkcolor="#c6d3e1",
+            arrowsize=14,
+            padding=6,
+            foreground="#132238",
+            insertcolor="#132238",
+        )
+        style.map(
+            "Friendly.TCombobox",
+            fieldbackground=[("readonly", "#ffffff")],
+            background=[("readonly", "#ffffff")],
+            foreground=[("readonly", "#132238")],
+        )
+
+    def apply_button_styles(self):
+        button_specs = [
+            (self.new_button, "subtle"),
+            (self.open_button, "subtle"),
+            (self.save_button, "primary"),
+            (self.add_button, "primary"),
+            (self.delete_button, "warning"),
+            (self.layout_button, "accent"),
+            (self.rel_button, "neutral"),
+            (self.zoom_out_button, "subtle"),
+            (self.zoom_in_button, "subtle"),
+            (self.zoom_reset_button, "subtle"),
+            (self.copy_code_button, "neutral"),
+            (self.refresh_code_button, "subtle"),
+            (self.sample_load_button, "ghost"),
+        ]
+        for button, variant in button_specs:
+            self.style_button(button, variant)
+
+    def style_button(self, button, variant="neutral", compact=False):
+        palette = {
+            "primary": ("#2f6fed", "#265ac0", "#2f6fed", "#ffffff"),
+            "accent": ("#d6f5ea", "#c0eadb", "#7bc8a4", "#1b4332"),
+            "warning": ("#fde6b1", "#f8d777", "#efc14a", "#5f4300"),
+            "neutral": ("#e8eef7", "#d7e2f0", "#c3d3e6", "#17324d"),
+            "subtle": ("#ffffff", "#f0f4f9", "#d1ddea", "#17324d"),
+            "ghost": ("#f7f9fc", "#eef3f8", "#d8e1ed", "#17324d"),
+        }
+        background, active_background, border, foreground = palette.get(variant, palette["neutral"])
+        button.config(
+            relief=tk.FLAT,
+            bd=0,
+            padx=10 if compact else 12,
+            pady=6 if compact else 7,
+            bg=background,
+            fg=foreground,
+            activebackground=active_background,
+            activeforeground=foreground,
+            highlightthickness=1,
+            highlightbackground=border,
+            highlightcolor=border,
+            font=("Segoe UI", 8 if compact else 9, "bold"),
+            cursor="hand2",
+        )
+
+    def refresh_code_preview(self):
+        if not hasattr(self, "code_preview"):
+            return
+
+        try:
+            mermaid_code = self.generate_mermaid()
+            line_count = len(mermaid_code.splitlines())
+            preview_text = mermaid_code
+            if hasattr(self, "code_meta_label"):
+                self.code_meta_label.config(
+                    text=f"{self.get_diagram_display_name()} · {line_count} line{'s' if line_count != 1 else ''}"
+                )
+        except Exception as exc:
+            preview_text = f"# Mermaid preview unavailable\n# {exc}"
+            if hasattr(self, "code_meta_label"):
+                self.code_meta_label.config(text="Preview unavailable")
+
+        self.code_preview.config(state=tk.NORMAL)
+        self.code_preview.delete("1.0", tk.END)
+        self.code_preview.insert("1.0", preview_text)
+        self.code_preview.config(state=tk.DISABLED)
+
+    def copy_mermaid_code(self):
+        try:
+            mermaid_code = self.generate_mermaid()
+        except Exception as exc:
+            messagebox.showerror("Copy Mermaid Code", f"Could not generate Mermaid code: {exc}")
+            return
+
+        self.root.clipboard_clear()
+        self.root.clipboard_append(mermaid_code)
+        self.update_status("Copied Mermaid code to clipboard")
+
+    def load_sample_diagram(self, sample_file):
+        sample_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), sample_file)
+        if not os.path.exists(sample_path):
+            messagebox.showerror("Sample Diagram", f"Could not find sample file:\n{sample_file}")
+            return
+        self.load_diagram_from_file(sample_path, prompt_for_unsaved=True, show_errors=True)
+
+    def load_selected_sample(self):
+        if not hasattr(self, "sample_map"):
+            return
+        sample_file = self.sample_map.get(self.sample_choice_var.get())
+        if sample_file:
+            self.load_sample_diagram(sample_file)
+
+    def create_palette_section_header(self, title, subtitle=None):
+        tk.Label(
+            self.palette_content,
+            text=title,
+            bg="#ffffff",
+            fg="#132238",
+            font=("Segoe UI Semibold", 11),
+        ).pack(pady=(2, 4))
+        if subtitle:
+            tk.Label(
+                self.palette_content,
+                text=subtitle,
+                bg="#ffffff",
+                fg="#647488",
+                font=("Segoe UI", 8),
+                wraplength=138,
+                justify=tk.LEFT,
+            ).pack(pady=(0, 8))
+
+    def create_palette_card(self, width=116, height=56):
+        frame = tk.Frame(self.palette_content, bg="#ffffff")
+        frame.pack(pady=4, padx=2, fill=tk.X)
+        canvas = tk.Canvas(
+            frame,
+            width=width,
+            height=height,
+            bg="#f8fbff",
+            highlightthickness=1,
+            highlightbackground="#d8e1ed",
+            relief=tk.FLAT,
+            bd=0,
+        )
+        canvas.pack()
+        canvas.config(cursor="hand2")
+        return frame, canvas
+
+    def add_palette_item_label(self, parent, label):
+        tk.Label(parent, text=label, bg="#ffffff", fg="#243447", font=("Segoe UI", 8)).pack(pady=(4, 0))
+
+    def update_palette_hint(self, text):
+        if hasattr(self, "palette_hint_label") and self.palette_hint_label.winfo_exists():
+            self.palette_hint_label.destroy()
+        self.palette_hint_label = tk.Label(
+            self.palette_content,
+            text=text,
+            bg="#ffffff",
+            fg="#6c7a89",
+            font=("Segoe UI", 8),
+            wraplength=136,
+            justify=tk.LEFT,
+        )
+        self.palette_hint_label.pack(side=tk.BOTTOM, pady=(10, 2))
+        
+    def create_flowchart_palette(self):
+        """Create flowchart shape palette"""
+        # Clear existing content
+        for widget in self.palette_content.winfo_children():
+            widget.destroy()
+        
+        self.create_palette_section_header("Flowchart", "Pick a shape, then click the canvas to arrange the flow.")
+        tk.Label(self.palette_content, text="Shapes", bg="#ffffff", fg="#576574", font=("Segoe UI", 9, "bold")).pack(pady=(2, 4))
+        
+        # Create canvas buttons for each shape
+        shapes = [
+            ("rectangle", "Rectangle", "lightblue"),
+            ("rounded", "Rounded", "lightgreen"),
+            ("diamond", "Diamond", "lightyellow"),
+            ("circle", "Circle", "lightcoral")
+        ]
+        
+        for shape_type, label, color in shapes:
+            frame, icon_canvas = self.create_palette_card(height=44)
+            
+            # Draw the shape icon
+            if shape_type == "rectangle":
+                icon_canvas.create_rectangle(18, 10, 98, 34, fill=color, outline="black", width=2)
+            elif shape_type == "rounded":
+                icon_canvas.create_rectangle(18, 10, 98, 34, fill=color, outline="black", width=2)
+                icon_canvas.create_oval(16, 8, 24, 16, fill=color, outline="black", width=1)
+                icon_canvas.create_oval(92, 8, 100, 16, fill=color, outline="black", width=1)
+            elif shape_type == "diamond":
+                icon_canvas.create_polygon(58, 8, 102, 22, 58, 36, 14, 22, fill=color, outline="black", width=2)
+            elif shape_type == "circle":
+                icon_canvas.create_oval(28, 8, 88, 36, fill=color, outline="black", width=2)
+            
+            self.add_palette_item_label(frame, label)
+            
+            # Bind click event
+            icon_canvas.bind("<Button-1>", lambda e, s=shape_type: self.add_shape_from_palette(s))
+        self.update_palette_hint("Tip: right-click empty space to add a default node quickly.")
+    
+    def create_uml_palette(self):
+        """Create UML class diagram palette"""
+        # Clear existing content
+        for widget in self.palette_content.winfo_children():
+            widget.destroy()
+        
+        self.create_palette_section_header("UML Class", "Add classes and pick a relationship type before drawing links.")
+        
+        # Add Class button
+        class_frame, class_canvas = self.create_palette_card(height=62)
+        
+        # Draw class icon
+        class_canvas.create_rectangle(18, 6, 98, 46, fill="lightyellow", outline="black", width=2)
+        class_canvas.create_line(18, 20, 98, 20, fill="black", width=1)
+        class_canvas.create_text(58, 13, text="Class", font=("Arial", 8, "bold"))
+        class_canvas.create_text(58, 33, text="+ attr\n+ method()", font=("Arial", 6))
+        
+        self.add_palette_item_label(class_frame, "Class")
+        class_canvas.bind("<Button-1>", lambda e: self.add_class())
+        
+        # Relationships section
+        tk.Label(self.palette_content, text="Relationships", bg="#ffffff", fg="#576574", font=("Segoe UI", 9, "bold")).pack(pady=(10, 4))
+        
+        relationships = [
+            ("association", "Association", "black", "solid", None),
+            ("inheritance", "Inheritance", "black", "solid", "triangle"),
+            ("composition", "Composition", "black", "solid", "diamond_filled"),
+            ("aggregation", "Aggregation", "black", "solid", "diamond_empty"),
+            ("dependency", "Dependency", "black", "dash", "arrow"),
+            ("realization", "Realization", "black", "dash", "triangle")
+        ]
+        
+        for rel_type, label, color, line_style, arrow_type in relationships:
+            frame, icon_canvas = self.create_palette_card(height=28)
+            
+            # Draw the relationship line
+            if line_style == "dash":
+                icon_canvas.create_line(14, 14, 102, 14, fill=color, width=2, dash=(4, 2))
+            else:
+                icon_canvas.create_line(14, 14, 102, 14, fill=color, width=2)
+            
+            # Draw arrow/symbol at the end
+            if arrow_type == "triangle":
+                # Inheritance arrow (empty triangle)
+                icon_canvas.create_polygon(102, 14, 92, 8, 92, 20, fill="white", outline=color, width=2)
+            elif arrow_type == "diamond_filled":
+                # Composition (filled diamond)
+                icon_canvas.create_polygon(102, 14, 95, 8, 88, 14, 95, 20, fill=color, outline=color, width=1)
+            elif arrow_type == "diamond_empty":
+                # Aggregation (empty diamond)
+                icon_canvas.create_polygon(102, 14, 95, 8, 88, 14, 95, 20, fill="white", outline=color, width=2)
+            elif arrow_type == "arrow":
+                # Dependency arrow
+                icon_canvas.create_line(102, 14, 92, 8, fill=color, width=2)
+                icon_canvas.create_line(102, 14, 92, 20, fill=color, width=2)
+            
+            self.add_palette_item_label(frame, label)
+            
+            # Bind click event
+            icon_canvas.bind("<Button-1>", lambda e, r=rel_type: self.select_relationship_from_palette(r))
+        self.update_palette_hint("Tip: click a relationship card to arm drawing mode, then click source and target classes.")
+    
+    def select_relationship_from_palette(self, rel_type):
+        """Select a relationship type and enter relationship mode, or change selected relationship type"""
+        if self.replace_selected_connection_type(rel_type):
+            self.update_status(f"Changed selected connector to {rel_type}")
+            return
+
+        self.rel_type_var.set(rel_type)
+        if not self.relationship_mode:
+            self.toggle_relationship_mode()
+        self.update_status(f"Click two elements to create a {rel_type} connector")
+
+    def on_relationship_type_changed(self, event=None):
+        connector_type = self.rel_type_var.get()
+        if self.relationship_mode:
+            self.update_status(f"Connector mode updated: next {self.get_connector_name()} will use {connector_type}")
+        else:
+            self.update_status(f"Selected {connector_type} {self.get_connector_name()} type")
+    
+    def create_sequence_palette(self):
+        """Create sequence diagram palette"""
+        for widget in self.palette_content.winfo_children():
+            widget.destroy()
+        
+        self.create_palette_section_header("Sequence", "Add participants, then choose the kind of message to draw.")
+        
+        # Add Actor button
+        frame, canvas = self.create_palette_card(height=64)
+        
+        # Draw actor icon
+        canvas.create_rectangle(28, 6, 88, 28, fill="lightblue", outline="black", width=2)
+        canvas.create_text(58, 17, text="Actor", font=("Arial", 8, "bold"))
+        canvas.create_line(58, 28, 58, 58, fill="gray", width=1, dash=(3, 3))
+        
+        self.add_palette_item_label(frame, "Actor")
+        canvas.bind("<Button-1>", lambda e: self.add_sequence_actor())
+        
+        # Message types
+        tk.Label(self.palette_content, text="Messages", bg="#ffffff", fg="#576574", font=("Segoe UI", 9, "bold")).pack(pady=(10, 4))
+        
+        messages = [
+            ("sync", "Sync Call", "solid", "arrow"),
+            ("async", "Async Call", "solid", "open"),
+            ("return", "Return", "dash", "open")
+        ]
+        
+        for msg_type, label, line_style, arrow in messages:
+            frame, canvas = self.create_palette_card(height=26)
+            
+            if line_style == "dash":
+                canvas.create_line(12, 13, 102, 13, fill="black", width=1, dash=(4, 2))
+            elif line_style == "solid":
+                canvas.create_line(12, 13, 102, 13, fill="black", width=2)
+            
+            if arrow == "arrow":
+                canvas.create_polygon(102, 13, 92, 8, 92, 18, fill="black")
+            elif arrow == "open":
+                canvas.create_line(102, 13, 92, 8, fill="black", width=2)
+                canvas.create_line(102, 13, 92, 18, fill="black", width=2)
+            
+            self.add_palette_item_label(frame, label)
+            canvas.bind("<Button-1>", lambda e, t=msg_type: self.select_relationship_from_palette(t))
+        self.update_palette_hint("Tip: sequence actors only move horizontally so messages stay aligned.")
+    
+    def create_state_palette(self):
+        """Create state diagram palette"""
+        for widget in self.palette_content.winfo_children():
+            widget.destroy()
+        
+        self.create_palette_section_header("State", "Add states and transitions, then drag them into a readable flow.")
+        
+        # Add State button
+        frame, canvas = self.create_palette_card(height=44)
+        
+        # Draw state icon (rounded rectangle)
+        canvas.create_rectangle(16, 10, 100, 34, fill="lightgreen", outline="black", width=2)
+        canvas.create_text(58, 22, text="State", font=("Arial", 8, "bold"))
+        
+        self.add_palette_item_label(frame, "State")
+        canvas.bind("<Button-1>", lambda e: self.add_state_node())
+        
+        # Start/End states
+        frame2, canvas2 = self.create_palette_card(height=44)
+        
+        # Draw start state (filled circle)
+        canvas2.create_oval(22, 14, 40, 32, fill="black", outline="black")
+        # Draw end state (double circle)
+        canvas2.create_oval(72, 14, 90, 32, fill="white", outline="black", width=2)
+        canvas2.create_oval(75, 17, 87, 29, fill="black", outline="black")
+        
+        self.add_palette_item_label(frame2, "Start / End")
+        
+        # Transitions
+        tk.Label(self.palette_content, text="Transitions", bg="#ffffff", fg="#576574", font=("Segoe UI", 9, "bold")).pack(pady=(10, 4))
+        
+        frame3, canvas3 = self.create_palette_card(height=26)
+        
+        canvas3.create_line(12, 13, 102, 13, fill="black", width=2)
+        canvas3.create_polygon(102, 13, 92, 8, 92, 18, fill="black")
+        
+        self.add_palette_item_label(frame3, "Transition")
+        canvas3.bind("<Button-1>", lambda e: self.select_relationship_from_palette("transition"))
+        self.update_palette_hint("Tip: labels on reverse transitions now separate automatically.")
+    
+    def create_er_palette(self):
+        """Create ER diagram palette"""
+        for widget in self.palette_content.winfo_children():
+            widget.destroy()
+        
+        self.create_palette_section_header("ER Diagram", "Add entities first, then connect them with cardinalities.")
+        
+        # Add Entity button
+        frame, canvas = self.create_palette_card(height=56)
+        
+        # Draw entity icon
+        canvas.create_rectangle(18, 6, 98, 44, fill="lightyellow", outline="black", width=2)
+        canvas.create_text(58, 16, text="Entity", font=("Arial", 8, "bold"))
+        canvas.create_line(18, 26, 98, 26, fill="black", width=1)
+        canvas.create_text(58, 36, text="id\nname", font=("Arial", 6))
+        
+        self.add_palette_item_label(frame, "Entity")
+        canvas.bind("<Button-1>", lambda e: self.add_er_entity())
+        
+        # Relationships
+        tk.Label(self.palette_content, text="Relationships", bg="#ffffff", fg="#576574", font=("Segoe UI", 9, "bold")).pack(pady=(10, 4))
+        
+        relationships = [
+            ("one-to-one", "One to One", "||--||"),
+            ("one-to-many", "One to Many", "||--o{"),
+            ("many-to-many", "Many to Many", "}o--o{")
+        ]
+        
+        for rel_type, label, symbol in relationships:
+            frame, canvas = self.create_palette_card(height=26)
+            
+            canvas.create_line(12, 13, 102, 13, fill="black", width=2)
+            canvas.create_text(57, 13, text=symbol, font=("Arial", 8))
+            
+            self.add_palette_item_label(frame, label)
+            canvas.bind("<Button-1>", lambda e, r=rel_type: self.select_relationship_from_palette(r))
+        self.update_palette_hint("Tip: ER cardinalities are pushed outside entity boxes for readability.")
+        
+    def add_shape_from_palette(self, shape_type):
+        """Add a flowchart node with the specified shape"""
+        if self.diagram_type != "flowchart":
+            return
+        
+        # Add node at a default position (user can drag it)
+        x = 200 + (len(self.flowchart_nodes) % 3) * 150
+        y = 200 + (len(self.flowchart_nodes) // 3) * 120
+        
+        node = FlowchartNode(self.canvas, x, y, f"node{len(self.flowchart_nodes) + 1}", 
+                            f"Node {len(self.flowchart_nodes) + 1}", shape_type, self)
+        self.flowchart_nodes.append(node)
+        
+        # Auto-select the new node
+        for n in self.flowchart_nodes:
+            n.deselect()
+        node.select()
+        self.selected_node = node
+        
+        self.update_scroll_region()
+        self.ensure_grid_behind()
+        self.mark_as_changed()
+        self.update_status(f"Added {shape_type} node")
+    
+    def add_sequence_actor(self):
+        """Add a sequence diagram actor"""
+        if self.diagram_type != "sequenceDiagram":
+            self.update_status("Actors can only be added in sequence diagrams")
+            return
+
+        x = 100 + len(self.sequence_actors) * 150
+        y = 50
+        actor = SequenceActor(self.canvas, x, y, f"Actor{len(self.sequence_actors) + 1}", self)
+        self.sequence_actors.append(actor)
+        self.update_scroll_region()
+        self.mark_as_changed()
+        self.update_status("Added actor")
+    
+    def add_state_node(self):
+        """Add a state diagram node"""
+        if self.diagram_type != "stateDiagram":
+            self.update_status("States can only be added in state diagrams")
+            return
+
+        x = 150 + (len(self.state_nodes) % 3) * 200
+        y = 150 + (len(self.state_nodes) // 3) * 120
+        state = StateNode(self.canvas, x, y, f"State{len(self.state_nodes) + 1}", self)
+        self.state_nodes.append(state)
+        self.update_scroll_region()
+        self.mark_as_changed()
+        self.update_status("Added state")
+    
+    def add_er_entity(self):
+        """Add an ER diagram entity"""
+        if self.diagram_type != "erDiagram":
+            self.update_status("Entities can only be added in ER diagrams")
+            return
+
+        x = 150 + (len(self.er_entities) % 3) * 200
+        y = 150 + (len(self.er_entities) // 3) * 150
+        entity = EREntity(self.canvas, x, y, f"Entity{len(self.er_entities) + 1}", self)
+        self.er_entities.append(entity)
+        self.update_scroll_region()
+        self.mark_as_changed()
+        self.update_status("Added entity")
+        
+    def get_diagram_display_name(self):
+        names = {
+            "classDiagram": "Class Diagram",
+            "flowchart": "Flowchart",
+            "sequenceDiagram": "Sequence Diagram",
+            "stateDiagram": "State Diagram",
+            "erDiagram": "ER Diagram",
+        }
+        return names.get(self.diagram_type, self.diagram_type)
+
+    def get_short_diagram_name(self):
+        names = {
+            "classDiagram": "Class",
+            "flowchart": "Flow",
+            "sequenceDiagram": "Sequence",
+            "stateDiagram": "State",
+            "erDiagram": "ER",
+        }
+        return names.get(self.diagram_type, self.diagram_type)
+
+    def get_primary_element_name(self):
+        names = {
+            "classDiagram": "class",
+            "flowchart": "node",
+            "sequenceDiagram": "actor",
+            "stateDiagram": "state",
+            "erDiagram": "entity",
+        }
+        return names.get(self.diagram_type, "element")
+
+    def get_primary_element_plural(self):
+        names = {
+            "classDiagram": "classes",
+            "flowchart": "nodes",
+            "sequenceDiagram": "actors",
+            "stateDiagram": "states",
+            "erDiagram": "entities",
+        }
+        return names.get(self.diagram_type, "elements")
+
+    def get_connector_name(self):
+        names = {
+            "classDiagram": "relationship",
+            "flowchart": "link",
+            "sequenceDiagram": "message",
+            "stateDiagram": "transition",
+            "erDiagram": "relationship",
+        }
+        return names.get(self.diagram_type, "connector")
+
+    def get_short_connector_name(self):
+        names = {
+            "classDiagram": "rels",
+            "flowchart": "links",
+            "sequenceDiagram": "msgs",
+            "stateDiagram": "transitions",
+            "erDiagram": "rels",
+        }
+        return names.get(self.diagram_type, "items")
+
+    def get_relationship_button_label(self):
+        base_action = {
+            "classDiagram": "Draw Relation",
+            "flowchart": "Draw Link",
+            "sequenceDiagram": "Draw Message",
+            "stateDiagram": "Draw Transition",
+            "erDiagram": "Draw Relation",
+        }.get(self.diagram_type, "Draw")
+        return "Cancel" if self.relationship_mode else base_action
+
+    def get_mode_hint_text(self):
+        if self.relationship_mode:
+            connector_type = self.rel_type_var.get()
+            return f"Connector mode: pick source, then target, to create a {connector_type} {self.get_connector_name()}."
+        return (
+            f"Right-click empty space to add a {self.get_primary_element_name()}. Drag to reposition. Delete removes the current selection."
+        )
+
+    def refresh_ui_feedback(self):
+        if hasattr(self, 'summary_label'):
+            self.summary_label.config(
+                text=(
+                    f"{self.get_diagram_display_name()}  |  "
+                    f"{len(self.get_active_node_collection())} {self.get_primary_element_plural()}  |  "
+                    f"{len(self.get_active_connection_collection())} {self.get_short_connector_name()}  |  "
+                    f"Zoom {int(self.zoom_level * 100)}%"
+                )
+            )
+        if hasattr(self, 'mode_hint_label'):
+            self.mode_hint_label.config(text=self.get_mode_hint_text())
+        if hasattr(self, 'info_banner'):
+            shortcut_hint = "Esc cancels connector mode" if self.relationship_mode else "Right-click empty space to add an element quickly"
+            self.info_banner.config(text=f"{self.current_status_message}   |   {shortcut_hint}")
+        if hasattr(self, 'document_label'):
+            current_name = os.path.basename(self.current_file) if self.current_file else "Untitled diagram"
+            self.document_label.config(text=current_name)
+        if hasattr(self, 'document_meta_label'):
+            save_state = "Unsaved changes" if self.has_unsaved_changes else "Saved"
+            self.document_meta_label.config(text=f"{save_state} · {self.get_diagram_display_name()}")
+        if hasattr(self, 'canvas_title_label'):
+            self.canvas_title_label.config(text=f"{self.get_diagram_display_name()} Canvas")
+        if hasattr(self, 'canvas_meta_label'):
+            location = os.path.basename(self.current_file) if self.current_file else "Local workspace"
+            self.canvas_meta_label.config(text=location)
+        if hasattr(self, 'rel_button'):
+            self.rel_button.config(
+                text=self.get_relationship_button_label(),
+                relief=tk.SUNKEN if self.relationship_mode else tk.RAISED,
+                bg="#cfe7d8" if self.relationship_mode else "#e8eef7",
+                activebackground="#bdddc9" if self.relationship_mode else "#d7e2f0",
+            )
+        self.refresh_code_preview()
+
     def update_status(self, message):
         """Update status bar message"""
+        self.current_status_message = message
         if hasattr(self, 'status_bar'):
             self.status_bar.config(text=message)
+        self.refresh_ui_feedback()
+
+    def log_debug(self, message):
+        if self.debug_logging:
+            print(f"Debug: {message}")
+
+    def log_warning(self, message):
+        print(f"Warning: {message}")
+
+    def get_active_node_collection(self):
+        if self.diagram_type == "flowchart":
+            return self.flowchart_nodes
+        if self.diagram_type == "sequenceDiagram":
+            return self.sequence_actors
+        if self.diagram_type == "stateDiagram":
+            return self.state_nodes
+        if self.diagram_type == "erDiagram":
+            return self.er_entities
+        return self.classes
+
+    def get_active_connection_collection(self):
+        if self.diagram_type == "flowchart":
+            return self.flowchart_connections
+        if self.diagram_type == "sequenceDiagram":
+            return self.sequence_messages
+        if self.diagram_type == "stateDiagram":
+            return self.state_transitions
+        if self.diagram_type == "erDiagram":
+            return self.er_relationships
+        return self.relationships
+
+    def get_all_connections(self):
+        return self.relationships + self.flowchart_connections + self.sequence_messages + self.state_transitions + self.er_relationships
+
+    def deselect_all_visuals(self):
+        for class_box in self.classes:
+            class_box.deselect()
+        for node in self.flowchart_nodes:
+            node.deselect()
+        for actor in self.sequence_actors:
+            actor.deselect()
+        for state in self.state_nodes:
+            state.deselect()
+        for entity in self.er_entities:
+            entity.deselect()
+        for connection in self.get_all_connections():
+            if getattr(connection, "selected", False):
+                connection.deselect()
+        self.selected_class = None
+        self.selected_node = None
+        self.selected_item = None
+
+    def find_active_node_at(self, canvas_x, canvas_y):
+        for node in self.get_active_node_collection():
+            zoom_level = self.zoom_level if hasattr(self, 'zoom_level') else 1.0
+            if self.diagram_type == "classDiagram":
+                width = getattr(node, 'width', 0)
+                height = getattr(node, 'height', 0)
+            else:
+                width = getattr(node, 'width', 0) * zoom_level
+                height = getattr(node, 'height', 0) * zoom_level
+            if node.x <= canvas_x <= node.x + width and node.y <= canvas_y <= node.y + height:
+                return node
+        return None
+
+    def create_mode_connection(self, source_node, target_node):
+        connection_type = self.rel_type_var.get()
+
+        if self.diagram_type == "flowchart":
+            label = simpledialog.askstring("Flowchart Label", "Connection label:", initialvalue="")
+            connection = FlowchartConnection(self.canvas, source_node, target_node, connection_type, label or "", self)
+            self.flowchart_connections.append(connection)
+        elif self.diagram_type == "sequenceDiagram":
+            label = simpledialog.askstring("Message Label", "Message label:", initialvalue="message")
+            connection = SequenceMessage(self.canvas, source_node, target_node, connection_type, label or "message", len(self.sequence_messages), self)
+            self.sequence_messages.append(connection)
+            self.reindex_sequence_messages()
+        elif self.diagram_type == "stateDiagram":
+            label = simpledialog.askstring("Transition Label", "Transition label:", initialvalue="")
+            connection = StateTransition(self.canvas, source_node, target_node, label or "", self)
+            self.state_transitions.append(connection)
+        elif self.diagram_type == "erDiagram":
+            label = simpledialog.askstring("Relationship Label", "Relationship label:", initialvalue="")
+            connection = ERRelationship(self.canvas, source_node, target_node, connection_type, label or "", self)
+            self.er_relationships.append(connection)
+        else:
+            connection = Relationship(self.canvas, source_node, target_node, connection_type, self)
+            self.relationships.append(connection)
+
+        self.ensure_grid_behind()
+        self.mark_as_changed()
+
+    def replace_selected_connection_type(self, new_type):
+        for connection in self.get_active_connection_collection():
+            if getattr(connection, "selected", False):
+                if hasattr(connection, "rel_type"):
+                    connection.rel_type = new_type
+                elif hasattr(connection, "conn_type"):
+                    connection.conn_type = new_type
+                elif hasattr(connection, "msg_type"):
+                    connection.msg_type = new_type
+                connection.update_position()
+                self.mark_as_changed()
+                return True
+        return False
+
+    def reindex_sequence_messages(self):
+        for index, message in enumerate(self.sequence_messages):
+            message.index = index
+            message.update_position()
     
     def update_relationships(self):
-        """Update all relationship positions when classes move"""
+        """Update all connector positions when elements move"""
         for rel in self.relationships:
+            rel.update_position()
+        for rel in self.flowchart_connections:
+            rel.update_position()
+        for rel in self.sequence_messages:
+            rel.update_position()
+        for rel in self.state_transitions:
+            rel.update_position()
+        for rel in self.er_relationships:
             rel.update_position()
         # Update scroll region after relationships change
         self.update_scroll_region()
+        # Ensure grid stays behind
+        self.ensure_grid_behind()
     
     def on_key_press(self, event):
         """Handle keyboard events"""
         if event.keysym == "Delete":
             self.delete_selected()
         elif event.keysym == "Escape":
-            # Deselect all and cancel relationship mode
-            for class_box in self.classes:
-                class_box.deselect()
-            for rel in self.relationships:
-                rel.deselect()
+            self.deselect_all_visuals()
             if self.relationship_mode:
                 self.toggle_relationship_mode()
             self.update_status("Ready")
@@ -1501,6 +3842,26 @@ class MermaidDiagramTool:
         
         # Return distance from point to closest point on line
         return math.sqrt((px - closest_x)**2 + (py - closest_y)**2)
+    
+    def on_canvas_configure(self, event):
+        """Handle canvas configure event (resize, scroll)"""
+        pass  # Grid scrolls automatically, no need to redraw
+    
+    def on_v_scroll(self, *args):
+        """Handle vertical scrollbar movement"""
+        self.canvas.yview(*args)
+    
+    def on_h_scroll(self, *args):
+        """Handle horizontal scrollbar movement"""
+        self.canvas.xview(*args)
+    
+    def on_canvas_y_scroll(self, *args):
+        """Handle canvas y-scroll update"""
+        self.v_scrollbar.set(*args)
+    
+    def on_canvas_x_scroll(self, *args):
+        """Handle canvas x-scroll update"""
+        self.h_scrollbar.set(*args)
     
     def on_mouse_wheel(self, event):
         """Handle mouse wheel for zooming"""
@@ -1546,6 +3907,11 @@ class MermaidDiagramTool:
             class_box.y = center_y + (class_box.y - center_y) * scale_factor
             class_box.width *= scale_factor
             class_box.height *= scale_factor
+
+        for collection in [self.flowchart_nodes, self.sequence_actors, self.state_nodes, self.er_entities]:
+            for node in collection:
+                node.x = center_x + (node.x - center_x) * scale_factor
+                node.y = center_y + (node.y - center_y) * scale_factor
         
         # Recreate all visuals with scaled fonts and positions
         self.recreate_visuals_with_zoom()
@@ -1601,12 +3967,68 @@ class MermaidDiagramTool:
             if was_selected:
                 class_box.select()
         
+        # Recreate flowchart node visuals
+        for node in self.flowchart_nodes:
+            was_selected = node.selected
+            node.selected = False
+            node.create_visual()
+            if was_selected:
+                node.select()
+        
+        # Recreate sequence actor visuals
+        for actor in self.sequence_actors:
+            was_selected = actor.selected
+            actor.selected = False
+            actor.create_visual()
+            if was_selected:
+                actor.select()
+        
+        # Recreate state node visuals
+        for state in self.state_nodes:
+            was_selected = state.selected
+            state.selected = False
+            state.create_visual()
+            if was_selected:
+                state.select()
+        
+        # Recreate ER entity visuals
+        for entity in self.er_entities:
+            was_selected = entity.selected
+            entity.selected = False
+            entity.create_visual()
+            if was_selected:
+                entity.select()
+        
         # Recreate relationship visuals
         for rel in self.relationships:
             was_selected = rel.selected
             rel.update_position()
             if was_selected:
                 rel.select()
+        for rel in self.flowchart_connections:
+            was_selected = rel.selected
+            rel.update_position()
+            if was_selected:
+                rel.select()
+        for rel in self.sequence_messages:
+            was_selected = rel.selected
+            rel.update_position()
+            if was_selected:
+                rel.select()
+        for rel in self.state_transitions:
+            was_selected = rel.selected
+            rel.update_position()
+            if was_selected:
+                rel.select()
+        for rel in self.er_relationships:
+            was_selected = rel.selected
+            rel.update_position()
+            if was_selected:
+                rel.select()
+        
+        # Redraw grid with new zoom level
+        if hasattr(self, 'show_grid') and self.show_grid.get():
+            self.draw_grid()
     
     def zoom_in(self):
         """Zoom in button handler"""
@@ -1621,8 +4043,25 @@ class MermaidDiagramTool:
         if self.zoom_level != 1.0:
             scale_factor = 1.0 / self.zoom_level
             self.apply_zoom(scale_factor)
+
+    def add_primary_element(self):
+        """Add the default element for the active diagram type."""
+        if self.diagram_type == "flowchart":
+            self.add_flowchart_node()
+        elif self.diagram_type == "sequenceDiagram":
+            self.add_sequence_actor()
+        elif self.diagram_type == "stateDiagram":
+            self.add_state_node()
+        elif self.diagram_type == "erDiagram":
+            self.add_er_entity()
+        else:
+            self.add_class()
     
     def add_class(self):
+        if self.diagram_type != "classDiagram":
+            self.update_status("Classes can only be added in class diagrams")
+            return
+            
         x = 150 + (len(self.classes) % 4) * 250  # Better positioning with wrapping
         y = 150 + (len(self.classes) // 4) * 200
         class_box = ClassBox(self.canvas, x, y, f"Class{len(self.classes) + 1}", self)
@@ -1635,7 +4074,102 @@ class MermaidDiagramTool:
         self.selected_class = class_box
         
         self.update_scroll_region()
+        self.ensure_grid_behind()
         self.mark_as_changed()
+    
+    def add_flowchart_node(self):
+        if self.diagram_type != "flowchart":
+            self.update_status("Flowchart nodes can only be added in flowcharts")
+            return
+
+        x = 150 + (len(self.flowchart_nodes) % 4) * 200
+        y = 150 + (len(self.flowchart_nodes) // 4) * 150
+        node = FlowchartNode(self.canvas, x, y, f"node{len(self.flowchart_nodes) + 1}", 
+                            f"Node {len(self.flowchart_nodes) + 1}", "rectangle", self)
+        self.flowchart_nodes.append(node)
+        
+        # Auto-select the new node
+        for n in self.flowchart_nodes:
+            n.deselect()
+        node.select()
+        self.selected_node = node
+        
+        self.update_scroll_region()
+        self.ensure_grid_behind()
+        self.mark_as_changed()
+
+    def update_diagram_type_ui(self):
+        """Update type-specific UI so each diagram mode only exposes valid tools."""
+        self.toggle_relationship_mode(force_off=True)
+
+        if self.diagram_type == "flowchart":
+            self.add_button.config(text="Add Node")
+            self.create_flowchart_palette()
+            rel_values = ["arrow", "line", "dotted", "thick"]
+            rel_label = "Flow:"
+            rel_text = "Add Link"
+            self.layout_button.config(state=tk.DISABLED)
+        elif self.diagram_type == "sequenceDiagram":
+            self.add_button.config(text="Add Actor")
+            self.create_sequence_palette()
+            rel_values = ["sync", "async", "return"]
+            rel_label = "Message:"
+            rel_text = "Add Message"
+            self.layout_button.config(state=tk.DISABLED)
+        elif self.diagram_type == "stateDiagram":
+            self.add_button.config(text="Add State")
+            self.create_state_palette()
+            rel_values = ["transition"]
+            rel_label = "State:"
+            rel_text = "Add Transition"
+            self.layout_button.config(state=tk.DISABLED)
+        elif self.diagram_type == "erDiagram":
+            self.add_button.config(text="Add Entity")
+            self.create_er_palette()
+            rel_values = ["one-to-one", "one-to-many", "many-to-many"]
+            rel_label = "ER:"
+            rel_text = "Add Relation"
+            self.layout_button.config(state=tk.DISABLED)
+        else:
+            self.add_button.config(text="Add Class")
+            self.create_uml_palette()
+            rel_values = ["association", "inheritance", "composition", "aggregation", "dependency", "realization"]
+            rel_label = "Class:"
+            rel_text = "Add Relationship"
+            self.layout_button.config(state=tk.NORMAL)
+
+        if not self.shape_palette.winfo_manager():
+            self.shape_palette.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.connection_label.config(text=rel_label)
+        self.rel_combo.config(values=rel_values, state="readonly")
+        self.rel_type_var.set(rel_values[0])
+        if hasattr(self, "sample_choice_var"):
+            preferred_sample = {
+                "classDiagram": "Class sample",
+                "flowchart": "Flowchart sample",
+                "sequenceDiagram": "Sequence sample",
+                "stateDiagram": "State sample",
+                "erDiagram": "ER sample",
+            }.get(self.diagram_type)
+            if preferred_sample:
+                self.sample_choice_var.set(preferred_sample)
+        self.rel_button.config(state=tk.NORMAL)
+        self.refresh_ui_feedback()
+        self.update_window_title()
+    
+    def on_diagram_type_changed(self, event=None):
+        new_type = self.diagram_type_var.get()
+        if new_type != self.diagram_type:
+            # Ask for confirmation if there are unsaved changes
+            if self.has_unsaved_changes:
+                if not messagebox.askyesno("Change Diagram Type", 
+                    "Changing diagram type will clear the current diagram. Continue?"):
+                    self.diagram_type_var.set(self.diagram_type)
+                    return
+            
+            self.diagram_type = new_type
+            self.new_diagram()
+            self.update_diagram_type_ui()
         
     def canvas_click(self, event):
         # Convert to canvas coordinates (accounts for scrolling and zoom)
@@ -1643,32 +4177,23 @@ class MermaidDiagramTool:
         canvas_y = self.canvas.canvasy(event.y)
         
         if self.relationship_mode:
-            # Find clicked class using canvas coordinates
-            clicked_class = None
-            for class_box in self.classes:
-                if (class_box.x <= canvas_x <= class_box.x + class_box.width and
-                    class_box.y <= canvas_y <= class_box.y + class_box.height):
-                    clicked_class = class_box
-                    break
-                    
-            if clicked_class:
+            clicked_node = self.find_active_node_at(canvas_x, canvas_y)
+
+            if clicked_node:
                 if self.relationship_start is None:
-                    self.relationship_start = clicked_class
-                    clicked_class.select()
+                    self.relationship_start = clicked_node
+                    clicked_node.select()
                 else:
-                    if clicked_class != self.relationship_start:
-                        # Create relationship
-                        rel = Relationship(self.canvas, self.relationship_start, 
-                                         clicked_class, self.rel_type_var.get(), self)
-                        self.relationships.append(rel)
-                        self.mark_as_changed()
+                    if clicked_node != self.relationship_start:
+                        self.create_mode_connection(self.relationship_start, clicked_node)
                     
                     # Reset relationship mode
                     if self.relationship_start:
                         self.relationship_start.deselect()
                     self.relationship_start = None
                     self.relationship_mode = False
-                    self.rel_button.config(text="Add Relationship", relief=tk.RAISED)
+                    self.refresh_ui_feedback()
+                    self.update_status(f"Added {self.get_connector_name()}")
         else:
             # Check if we clicked on a class with improved detection using canvas coordinates
             clicked_class = None
@@ -1713,8 +4238,21 @@ class MermaidDiagramTool:
                 self.update_status(f"Selected class: {clicked_class.name}")
                 
             elif clicked_relationship:
-                # Clicked on a relationship - not panning
+                # Clicked on a relationship - select it
                 self.is_panning = False
+                
+                # Deselect all classes
+                for class_box in self.classes:
+                    class_box.deselect()
+                
+                # Deselect all other relationships
+                for rel in self.relationships:
+                    rel.deselect()
+                
+                # Select the clicked relationship
+                clicked_relationship.select()
+                self.selected_class = None
+                self.update_status(f"Selected {clicked_relationship.rel_type} relationship - click a relationship type in the palette to change it")
                 
             else:
                 # Clicked on empty space - check if really empty
@@ -1722,32 +4260,76 @@ class MermaidDiagramTool:
                 canvas_x = self.canvas.canvasx(event.x)
                 canvas_y = self.canvas.canvasy(event.y)
                 
-                # Double-check no class at this position (using canvas coordinates)
+                # Double-check no element at this position (using canvas coordinates)
                 really_empty = True
+                
+                # Check classes
                 for class_box in self.classes:
                     if (class_box.x <= canvas_x <= class_box.x + class_box.width and
                         class_box.y <= canvas_y <= class_box.y + class_box.height):
                         really_empty = False
                         break
                 
+                # Check flowchart nodes
                 if really_empty:
-                    # Start panning
+                    for node in self.flowchart_nodes:
+                        if (node.x <= canvas_x <= node.x + node.width and
+                            node.y <= canvas_y <= node.y + node.height):
+                            really_empty = False
+                            break
+                
+                # Check sequence actors
+                if really_empty:
+                    for actor in self.sequence_actors:
+                        if (actor.x <= canvas_x <= actor.x + actor.width and
+                            actor.y <= canvas_y <= actor.y + actor.height):
+                            really_empty = False
+                            break
+                
+                # Check state nodes
+                if really_empty:
+                    for state in self.state_nodes:
+                        if (state.x <= canvas_x <= state.x + state.width and
+                            state.y <= canvas_y <= state.y + state.height):
+                            really_empty = False
+                            break
+                
+                # Check ER entities
+                if really_empty:
+                    for entity in self.er_entities:
+                        if (entity.x <= canvas_x <= entity.x + entity.width and
+                            entity.y <= canvas_y <= entity.y + entity.height):
+                            really_empty = False
+                            break
+                
+                if really_empty:
+                    # Start panning - store initial position
                     self.is_panning = True
-                    self.pan_start_x = canvas_x
-                    self.pan_start_y = canvas_y
+                    self.pan_start_x = event.x
+                    self.pan_start_y = event.y
                     
                     # Change cursor to indicate panning mode
                     self.canvas.config(cursor="fleur")  # Four-way arrow cursor
                     
-                    # Deselect all classes
+                    # Deselect all elements
                     for class_box in self.classes:
                         class_box.deselect()
+                    for node in self.flowchart_nodes:
+                        node.deselect()
+                    for actor in self.sequence_actors:
+                        actor.deselect()
+                    for state in self.state_nodes:
+                        state.deselect()
+                    for entity in self.er_entities:
+                        entity.deselect()
                     
                     # Deselect all relationships
                     for rel in self.relationships:
                         rel.deselect()
                     
                     self.selected_class = None
+                    self.selected_node = None
+                    self.selected_item = None
                     self.update_status("Pan mode - drag to move diagram")
                 else:
                     self.is_panning = False
@@ -1755,45 +4337,39 @@ class MermaidDiagramTool:
     def canvas_drag(self, event):
         """Handle canvas drag for panning"""
         # Don't pan if a class is selected (it's being dragged individually)
-        if self.selected_class is not None:
+        if self.selected_class is not None or self.selected_node is not None or self.selected_item is not None:
             return
             
         if self.is_panning:
-            # Convert to canvas coordinates
-            canvas_x = self.canvas.canvasx(event.x)
-            canvas_y = self.canvas.canvasy(event.y)
+            # Calculate movement delta
+            dx = event.x - self.pan_start_x
+            dy = event.y - self.pan_start_y
             
-            # Calculate drag distance
-            dx = canvas_x - self.pan_start_x
-            dy = canvas_y - self.pan_start_y
-            
-            # Move all classes
-            for class_box in self.classes:
-                class_box.x += dx
-                class_box.y += dy
+            # Get scrollregion
+            scrollregion = self.canvas.cget("scrollregion").split()
+            if len(scrollregion) == 4:
+                x1, y1, x2, y2 = map(float, scrollregion)
+                width = x2 - x1
+                height = y2 - y1
                 
-                # Move all visual elements
-                if hasattr(class_box, 'visual_elements'):
-                    for element in class_box.visual_elements:
-                        self.canvas.move(element, dx, dy)
+                # Get canvas dimensions
+                canvas_width = self.canvas.winfo_width()
+                canvas_height = self.canvas.winfo_height()
                 
-                # Move content elements
-                for item in self.canvas.find_withtag("content_" + str(id(class_box))):
-                    self.canvas.move(item, dx, dy)
+                # Calculate scroll amount as fraction of scrollable area
+                if width > canvas_width:
+                    scroll_x = -dx / (width - canvas_width)
+                    current_x = self.canvas.xview()[0]
+                    self.canvas.xview_moveto(max(0, min(1, current_x + scroll_x)))
                 
-                # Update selection indicators if selected
-                if class_box.selected:
-                    class_box.update_selection_indicators()
+                if height > canvas_height:
+                    scroll_y = -dy / (height - canvas_height)
+                    current_y = self.canvas.yview()[0]
+                    self.canvas.yview_moveto(max(0, min(1, current_y + scroll_y)))
             
-            # Update all relationships
-            self.update_relationships()
-            
-            # Update pan start position for next drag event
-            self.pan_start_x = canvas_x
-            self.pan_start_y = canvas_y
-            
-            # Update scroll region
-            self.update_scroll_region()
+            # Update start position for next drag event
+            self.pan_start_x = event.x
+            self.pan_start_y = event.y
         # If not panning, the drag event will be handled by individual class objects
     
     def canvas_release(self, event):
@@ -1803,13 +4379,6 @@ class MermaidDiagramTool:
             # Reset cursor to default
             self.canvas.config(cursor="")
             self.update_status("Ready")
-            
-            # Auto-save positions after panning (if we have a current file)
-            if self.current_file and os.path.exists(self.current_file):
-                try:
-                    self.save_positions(self.current_file)
-                except Exception as e:
-                    print(f"Warning: Could not auto-save positions after panning: {e}")
     
     def canvas_motion(self, event):
         """Handle mouse motion to update cursor"""
@@ -1836,25 +4405,22 @@ class MermaidDiagramTool:
             self.canvas.config(cursor="")  # Default cursor over empty space
     
     def canvas_right_click(self, event):
-        """Handle right-click to create new class"""
-        if not self.relationship_mode:
-            # Convert to canvas coordinates
-            canvas_x = self.canvas.canvasx(event.x)
-            canvas_y = self.canvas.canvasy(event.y)
-            
-            # Check if we right-clicked on a class first
-            clicked_class = None
-            for class_box in self.classes:
-                if (class_box.x <= canvas_x <= class_box.x + class_box.width and
-                    class_box.y <= canvas_y <= class_box.y + class_box.height):
-                    clicked_class = class_box
-                    break
-            
-            # Only create new class if we didn't right-click on an existing one
-            if not clicked_class:
-                self.add_class_at_position(canvas_x, canvas_y)
+        """Handle right-click quick-create for the active diagram type."""
+        if self.relationship_mode:
+            return
+
+        # Convert to canvas coordinates
+        canvas_x = self.canvas.canvasx(event.x)
+        canvas_y = self.canvas.canvasy(event.y)
+        clicked_node = self.find_active_node_at(canvas_x, canvas_y)
+
+        if not clicked_node:
+            self.add_primary_element_at_position(canvas_x, canvas_y)
             
     def add_class_at_position(self, x, y):
+        if self.diagram_type != "classDiagram":
+            return
+
         class_box = ClassBox(self.canvas, x, y, f"Class{len(self.classes) + 1}", self)
         self.classes.append(class_box)
         
@@ -1865,14 +4431,68 @@ class MermaidDiagramTool:
         self.selected_class = class_box
         
         self.update_scroll_region()
+        self.ensure_grid_behind()
+        self.mark_as_changed()
+
+    def add_primary_element_at_position(self, x, y):
+        if self.diagram_type == "flowchart":
+            node = FlowchartNode(self.canvas, x, y, f"node{len(self.flowchart_nodes) + 1}", f"Node {len(self.flowchart_nodes) + 1}", "rectangle", self)
+            self.flowchart_nodes.append(node)
+            self.selected_node = node
+            node.select()
+        elif self.diagram_type == "sequenceDiagram":
+            actor = SequenceActor(self.canvas, x, y, f"Actor{len(self.sequence_actors) + 1}", self)
+            self.sequence_actors.append(actor)
+            self.selected_item = actor
+            actor.select()
+        elif self.diagram_type == "stateDiagram":
+            state = StateNode(self.canvas, x, y, f"State{len(self.state_nodes) + 1}", self)
+            self.state_nodes.append(state)
+            self.selected_item = state
+            state.select()
+        elif self.diagram_type == "erDiagram":
+            entity = EREntity(self.canvas, x, y, f"Entity{len(self.er_entities) + 1}", self)
+            self.er_entities.append(entity)
+            self.selected_item = entity
+            entity.select()
+        else:
+            self.add_class_at_position(x, y)
+            return
+
+        self.update_scroll_region()
         self.mark_as_changed()
         
     def delete_selected(self):
+        deleted_any = False
         # Delete selected classes
         to_remove = []
         for class_box in self.classes:
             if class_box.selected:
                 to_remove.append(class_box)
+        
+        # Delete selected flowchart nodes
+        nodes_to_remove = []
+        for node in self.flowchart_nodes:
+            if node.selected:
+                nodes_to_remove.append(node)
+        
+        # Delete selected sequence actors
+        actors_to_remove = []
+        for actor in self.sequence_actors:
+            if actor.selected:
+                actors_to_remove.append(actor)
+        
+        # Delete selected state nodes
+        states_to_remove = []
+        for state in self.state_nodes:
+            if state.selected:
+                states_to_remove.append(state)
+        
+        # Delete selected ER entities
+        entities_to_remove = []
+        for entity in self.er_entities:
+            if entity.selected:
+                entities_to_remove.append(entity)
                 
         for class_box in to_remove:
             # Remove relationships involving this class
@@ -1888,6 +4508,43 @@ class MermaidDiagramTool:
             # Remove class
             class_box.delete()
             self.classes.remove(class_box)
+            deleted_any = True
+        
+        for node in nodes_to_remove:
+            for conn in list(self.flowchart_connections):
+                if conn.from_node == node or conn.to_node == node:
+                    conn.delete()
+                    self.flowchart_connections.remove(conn)
+            node.delete()
+            self.flowchart_nodes.remove(node)
+            deleted_any = True
+        
+        for actor in actors_to_remove:
+            for conn in list(self.sequence_messages):
+                if conn.from_actor == actor or conn.to_actor == actor:
+                    conn.delete()
+                    self.sequence_messages.remove(conn)
+            actor.delete()
+            self.sequence_actors.remove(actor)
+            deleted_any = True
+        
+        for state in states_to_remove:
+            for conn in list(self.state_transitions):
+                if conn.from_state == state or conn.to_state == state:
+                    conn.delete()
+                    self.state_transitions.remove(conn)
+            state.delete()
+            self.state_nodes.remove(state)
+            deleted_any = True
+        
+        for entity in entities_to_remove:
+            for conn in list(self.er_relationships):
+                if conn.from_entity == entity or conn.to_entity == entity:
+                    conn.delete()
+                    self.er_relationships.remove(conn)
+            entity.delete()
+            self.er_entities.remove(entity)
+            deleted_any = True
             
         # Delete selected relationships
         rel_to_remove = []
@@ -1898,26 +4555,77 @@ class MermaidDiagramTool:
         for rel in rel_to_remove:
             rel.delete()
             self.relationships.remove(rel)
-        
+            deleted_any = True
+
+        for rel in list(self.flowchart_connections):
+            if rel.selected:
+                rel.delete()
+                self.flowchart_connections.remove(rel)
+                deleted_any = True
+
+        for rel in list(self.sequence_messages):
+            if rel.selected:
+                rel.delete()
+                self.sequence_messages.remove(rel)
+                deleted_any = True
+        if deleted_any and self.sequence_messages:
+            self.reindex_sequence_messages()
+
+        for rel in list(self.state_transitions):
+            if rel.selected:
+                rel.delete()
+                self.state_transitions.remove(rel)
+                deleted_any = True
+
+        for rel in list(self.er_relationships):
+            if rel.selected:
+                rel.delete()
+                self.er_relationships.remove(rel)
+                deleted_any = True
+
         # Mark as changed if anything was deleted
-        if to_remove or rel_to_remove:
+        if deleted_any:
             self.mark_as_changed()
+            self.deselect_all_visuals()
+            self.update_scroll_region()
+            self.ensure_grid_behind()
             
-    def toggle_relationship_mode(self):
-        if self.relationship_mode:
+    def toggle_relationship_mode(self, force_off=False):
+        if self.relationship_mode or force_off:
             self.relationship_mode = False
-            self.rel_button.config(text="Add Relationship", relief=tk.RAISED)
             if self.relationship_start:
                 self.relationship_start.deselect()
             self.relationship_start = None
+            self.refresh_ui_feedback()
         else:
             self.relationship_mode = True
-            self.rel_button.config(text="Cancel Relationship", relief=tk.SUNKEN)
+            self.refresh_ui_feedback()
+            self.update_status(f"Click two elements to create a {self.rel_type_var.get()} connector")
             
     def update_scroll_region(self):
         """Update canvas scroll region to include all elements with padding"""
-        # Get bounding box of all items on canvas
+        # Get bounding box of all items on canvas, excluding grid
+        # Delete grid temporarily to get accurate bbox
+        grid_items_coords = []
+        grid_items = list(self.canvas.find_withtag("grid"))
+        
+        # Store grid line coordinates and delete them
+        for item in grid_items:
+            try:
+                coords = self.canvas.coords(item)
+                fill = self.canvas.itemcget(item, "fill")
+                grid_items_coords.append((coords, fill))
+                self.canvas.delete(item)
+            except:
+                pass
+        
         bbox = self.canvas.bbox("all")
+        
+        # Recreate grid lines
+        for coords, fill in grid_items_coords:
+            if len(coords) == 4:
+                self.canvas.create_line(coords[0], coords[1], coords[2], coords[3], 
+                                       fill=fill, tags="grid", state="normal")
         
         if bbox:
             # Add padding around the content
@@ -1933,6 +4641,98 @@ class MermaidDiagramTool:
         else:
             # Default scroll region if no items
             self.canvas.configure(scrollregion=(0, 0, 2000, 2000))
+        
+        # Only redraw grid if scroll region significantly changed
+        # (Don't redraw during dragging to avoid visual glitches)
+        if hasattr(self, 'show_grid') and self.show_grid.get():
+            # Check if we need to expand the grid
+            if hasattr(self, '_last_grid_region'):
+                old_x1, old_y1, old_x2, old_y2 = self._last_grid_region
+                if bbox:
+                    new_x1, new_y1, new_x2, new_y2 = bbox
+                    # Only redraw if the new region is significantly larger
+                    if (new_x1 < old_x1 - 200 or new_y1 < old_y1 - 200 or 
+                        new_x2 > old_x2 + 200 or new_y2 > old_y2 + 200):
+                        self.draw_grid()
+                        self._last_grid_region = bbox
+                        self.canvas.after_idle(self.ensure_grid_behind)
+            else:
+                # First time, draw the grid
+                self.draw_grid()
+                if bbox:
+                    self._last_grid_region = bbox
+                self.canvas.after_idle(self.ensure_grid_behind)
+        
+        # Ensure grid stays behind after scroll region update
+        if grid_items_coords:
+            self.canvas.after_idle(self.ensure_grid_behind)
+    
+    def toggle_grid(self):
+        """Toggle grid visibility"""
+        if self.show_grid.get():
+            self.draw_grid()
+            # Store the current bbox for future comparisons
+            bbox = self.canvas.bbox("all")
+            if bbox:
+                self._last_grid_region = bbox
+            self.canvas.after_idle(self.ensure_grid_behind)
+        else:
+            self.hide_grid()
+            # Clear the stored region
+            if hasattr(self, '_last_grid_region'):
+                delattr(self, '_last_grid_region')
+    
+    def draw_grid(self):
+        """Draw grid on canvas (draws once, scrolls automatically)"""
+        # Remove existing grid
+        self.canvas.delete("grid")
+        
+        # Get scroll region
+        scroll_region = self.canvas.cget("scrollregion").split()
+        if len(scroll_region) == 4:
+            x1, y1, x2, y2 = map(float, scroll_region)
+        else:
+            x1, y1, x2, y2 = 0, 0, 2000, 2000
+        
+        # Grid spacing (scaled by zoom level)
+        base_spacing = 50
+        spacing = base_spacing * self.zoom_level
+        
+        # Ensure minimum spacing
+        if spacing < 10:
+            spacing = 10
+        
+        # Grid color
+        grid_color = "#e0e0e0"
+        
+        # Draw vertical lines across entire scroll region
+        x = int(x1 / spacing) * spacing
+        while x <= x2:
+            self.canvas.create_line(x, y1, x, y2, fill=grid_color, tags="grid", state="normal")
+            x += spacing
+        
+        # Draw horizontal lines across entire scroll region
+        y = int(y1 / spacing) * spacing
+        while y <= y2:
+            self.canvas.create_line(x1, y, x2, y, fill=grid_color, tags="grid", state="normal")
+            y += spacing
+        
+        # Lower grid to the very bottom immediately (only if grid items exist)
+        if self.canvas.find_withtag("grid"):
+            self.canvas.tag_lower("grid")
+            # Schedule another lowering after idle to ensure it stays behind
+            self.canvas.after_idle(lambda: self.canvas.tag_lower("grid") if self.canvas.find_withtag("grid") else None)
+    
+    def hide_grid(self):
+        """Hide grid from canvas"""
+        self.canvas.delete("grid")
+    
+    def ensure_grid_behind(self):
+        """Ensure grid stays behind all other elements"""
+        if hasattr(self, 'show_grid') and self.show_grid.get():
+            # Only lower if grid items exist
+            if self.canvas.find_withtag("grid"):
+                self.canvas.tag_lower("grid")
         
     def save_mermaid(self):
         """Save diagram as Mermaid format"""
@@ -1966,101 +4766,83 @@ class MermaidDiagramTool:
             
     def open_mermaid(self):
         """Open and load a Mermaid diagram"""
-        # Check for unsaved changes
-        if self.has_unsaved_changes:
-            response = messagebox.askyesnocancel(
-                "Unsaved Changes",
-                "You have unsaved changes. Do you want to save before opening a new file?"
-            )
-            
-            if response is None:  # Cancel
-                return
-            elif response:  # Yes - save
-                self.save_mermaid()
-                if self.has_unsaved_changes:  # Save was cancelled
-                    return
-        
         filename = filedialog.askopenfilename(
             filetypes=[("Markdown files", "*.md"), ("Text files", "*.txt"), ("All files", "*.*")]
         )
         if filename:
-            try:
-                # Try UTF-8 first, then fall back to other encodings
-                content = None
-                encodings = ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252', 'iso-8859-1']
-                
-                for encoding in encodings:
-                    try:
-                        with open(filename, 'r', encoding=encoding) as f:
-                            content = f.read()
-                        break  # Success, stop trying
-                    except UnicodeDecodeError:
-                        continue  # Try next encoding
-                
-                if content is None:
-                    messagebox.showerror("Error", "Could not decode file. Please ensure it's a text file.")
-                    return
-                
-                # Extract mermaid code from markdown code blocks or plain text
-                mermaid_code = self.extract_mermaid_code(content)
-                if mermaid_code:
-                    # Check if position file exists before parsing
-                    positions = self.load_positions(filename)
-                    
-                    # Set zoom level BEFORE parsing if we have saved positions (don't move classes)
-                    if positions and "zoom_level" in positions:
-                        saved_zoom = positions["zoom_level"]
-                        if saved_zoom > 0:
-                            print(f"Debug: Setting zoom level to: {saved_zoom}")
-                            self.set_zoom_level(saved_zoom)
-                    
-                    # Parse diagram (skip auto-layout if we have saved positions)
-                    self.parse_mermaid(mermaid_code, apply_auto_layout=(positions is None))
-                    
-                    # Apply saved positions if they exist (but skip zoom since we already did it)
-                    if positions:
-                        self.apply_positions(positions, skip_zoom=True)
-                        self.update_status(f"Loaded from {os.path.basename(filename)} (with saved positions)")
-                    else:
-                        self.update_status(f"Loaded from {os.path.basename(filename)} (auto-layout applied)")
-                    
-                    self.current_file = filename
-                    self.mark_as_saved()
-                    self.save_last_file_path()
-                else:
-                    messagebox.showerror("Error", "No valid Mermaid class diagram found in file")
-                    
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to open file: {str(e)}")
-    
+            self.load_diagram_from_file(filename, prompt_for_unsaved=True, show_errors=True)
+
     def new_diagram(self):
         """Create a new diagram"""
-        # Check for unsaved changes
         if self.has_unsaved_changes:
             response = messagebox.askyesnocancel(
                 "Unsaved Changes",
                 "You have unsaved changes. Do you want to save before creating a new diagram?"
             )
-            
-            if response is None:  # Cancel
+
+            if response is None:
                 return
-            elif response:  # Yes - save
+            if response:
                 self.save_mermaid()
-                if self.has_unsaved_changes:  # Save was cancelled
+                if self.has_unsaved_changes:
                     return
-        
-        # Clear the diagram
-        for class_box in self.classes:
-            class_box.delete()
-        for rel in self.relationships:
-            rel.delete()
-        self.classes.clear()
-        self.relationships.clear()
-        
+
+        self.clear_diagram()
+        if self.zoom_level != 1.0:
+            self.set_zoom_level(1.0)
+        else:
+            if hasattr(self, 'zoom_label'):
+                self.zoom_label.config(text="100%")
+        self.canvas.xview_moveto(0)
+        self.canvas.yview_moveto(0)
         self.current_file = None
         self.mark_as_saved()
         self.update_status("New diagram created")
-        
+
+    def clear_diagram(self):
+        """Remove all diagram elements without prompting the user."""
+        for class_box in self.classes:
+            class_box.delete()
+        for node in self.flowchart_nodes:
+            node.delete()
+        for actor in self.sequence_actors:
+            actor.delete()
+        for state in self.state_nodes:
+            state.delete()
+        for entity in self.er_entities:
+            entity.delete()
+        for rel in self.relationships:
+            rel.delete()
+        for rel in self.flowchart_connections:
+            rel.delete()
+        for rel in self.sequence_messages:
+            rel.delete()
+        for rel in self.state_transitions:
+            rel.delete()
+        for rel in self.er_relationships:
+            rel.delete()
+        self.classes.clear()
+        self.flowchart_nodes.clear()
+        self.flowchart_connections.clear()
+        self.sequence_actors.clear()
+        self.sequence_messages.clear()
+        self.state_nodes.clear()
+        self.state_transitions.clear()
+        self.er_entities.clear()
+        self.er_relationships.clear()
+        self.relationships.clear()
+        self.selected_class = None
+        self.selected_node = None
+        self.selected_item = None
+        self.relationship_start = None
+        self.relationship_mode = False
+        if hasattr(self, 'rel_button'):
+            self.rel_button.config(relief=tk.RAISED)
+        self.refresh_ui_feedback()
+        self.update_scroll_region()
+        self.canvas.xview_moveto(0)
+        self.canvas.yview_moveto(0)
+
     def extract_mermaid_code(self, content):
         """Extract Mermaid code from markdown code blocks or plain text"""
         # Try to find mermaid code block first
@@ -2071,15 +4853,253 @@ class MermaidDiagramTool:
             return match.group(1).strip()
         
         # If no code block, check if the entire content is mermaid
-        if 'classDiagram' in content:
+        if any(diagram_type in content for diagram_type in ("classDiagram", "flowchart", "graph", "sequenceDiagram", "stateDiagram", "erDiagram")):
             return content.strip()
         
         return None
     
+    def detect_mermaid_diagram_type(self, mermaid_code):
+        """Detect the Mermaid diagram type without mutating the current canvas."""
+        lines = [line.strip() for line in mermaid_code.split('\n') if line.strip()]
+
+        if any(line.startswith('flowchart') or line.startswith('graph') for line in lines):
+            return "flowchart"
+        if any('sequenceDiagram' in line for line in lines):
+            return "sequenceDiagram"
+        if any('stateDiagram' in line for line in lines):
+            return "stateDiagram"
+        if any('erDiagram' in line for line in lines):
+            return "erDiagram"
+        if any('classDiagram' in line for line in lines):
+            return "classDiagram"
+        raise ValueError("Not a valid Mermaid diagram")
+
     def parse_mermaid(self, mermaid_code, apply_auto_layout=True):
-        """Parse Mermaid class diagram code and create visual elements"""
-        self.new_diagram()  # Clear current diagram
+        """Parse Mermaid diagram code and create visual elements"""
+        diagram_type = self.detect_mermaid_diagram_type(mermaid_code)
+        self.clear_diagram()
+        self.diagram_type = diagram_type
+        self.diagram_type_var.set(diagram_type)
+        self.update_diagram_type_ui()
+
+        if diagram_type == "flowchart":
+            return self.parse_flowchart(mermaid_code)
+        if diagram_type == "sequenceDiagram":
+            return self.parse_sequence_diagram(mermaid_code)
+        if diagram_type == "stateDiagram":
+            return self.parse_state_diagram(mermaid_code)
+        if diagram_type == "erDiagram":
+            return self.parse_er_diagram(mermaid_code)
+        return self.parse_class_diagram(mermaid_code, apply_auto_layout)
+    
+    def parse_flowchart(self, mermaid_code):
+        """Parse flowchart code."""
+        lines = [line.strip() for line in mermaid_code.split('\n') if line.strip()]
         
+        nodes_data = {}
+        connections = []
+        
+        for line in lines:
+            if line.startswith('flowchart') or line.startswith('graph'):
+                continue
+            
+            circle_match = re.match(r'(\w+)\(\((.+)\)\)', line)
+            if circle_match:
+                node_id, text = circle_match.groups()
+                nodes_data[node_id] = {'text': text, 'shape': 'circle'}
+                continue
+
+            # Parse node definitions: nodeId[text] or nodeId(text) or nodeId{text}
+            node_match = re.match(r'(\w+)([\[\(\{])([^\]\)\}]+)([\]\)\}])', line)
+            if node_match:
+                node_id, open_br, text, close_br = node_match.groups()
+                shape = "rectangle"
+                if open_br == '(' and close_br == ')':
+                    shape = "rounded"
+                elif open_br == '{' and close_br == '}':
+                    shape = "diamond"
+                nodes_data[node_id] = {'text': text, 'shape': shape}
+                continue
+            
+            # Parse connections: A --> B or A --- B, optionally with a label
+            conn_match = re.match(r'(\w+)\s*(-->|---|-\.->|==>)(?:\|([^|]+)\|)?\s*(\w+)', line)
+            if conn_match:
+                from_node, conn_type, label, to_node = conn_match.groups()
+                flow_type_map = {
+                    "-->": "arrow",
+                    "---": "line",
+                    "-.->": "dotted",
+                    "==>": "thick"
+                }
+                connections.append((from_node, to_node, flow_type_map.get(conn_type, "arrow"), label or ""))
+                # Ensure nodes exist
+                if from_node not in nodes_data:
+                    nodes_data[from_node] = {'text': from_node, 'shape': 'rectangle'}
+                if to_node not in nodes_data:
+                    nodes_data[to_node] = {'text': to_node, 'shape': 'rectangle'}
+        
+        # Create nodes
+        x, y = 150, 150
+        for i, (node_id, data) in enumerate(nodes_data.items()):
+            node = FlowchartNode(self.canvas, x, y, node_id, data['text'], data['shape'], self)
+            self.flowchart_nodes.append(node)
+            x += 200
+            if (i + 1) % 4 == 0:
+                x = 150
+                y += 150
+        
+        node_lookup = {node.node_id: node for node in self.flowchart_nodes}
+        for from_node, to_node, conn_type, label in connections:
+            if from_node in node_lookup and to_node in node_lookup:
+                self.flowchart_connections.append(
+                    FlowchartConnection(self.canvas, node_lookup[from_node], node_lookup[to_node], conn_type, label, self)
+                )
+        
+        self.update_scroll_region()
+        self.update_status(f"Loaded flowchart with {len(self.flowchart_nodes)} nodes")
+
+    def parse_sequence_diagram(self, mermaid_code):
+        lines = [line.strip() for line in mermaid_code.split('\n') if line.strip()]
+        actor_lookup = {}
+        message_rows = []
+
+        for line in lines:
+            if line.startswith("sequenceDiagram"):
+                continue
+            participant_match = re.match(r'(participant|actor)\s+([A-Za-z0-9_]+)(?:\s+as\s+(.+))?', line)
+            if participant_match:
+                _, actor_id, display_name = participant_match.groups()
+                actor_lookup[actor_id] = {"name": (display_name or actor_id).strip()}
+                continue
+
+            msg_match = re.match(r'([A-Za-z0-9_]+)\s*(-{1,2}>>|\-{1,2}>|-->>)\s*([A-Za-z0-9_]+)\s*:\s*(.+)', line)
+            if msg_match:
+                source, arrow, target, label = msg_match.groups()
+                msg_type = "sync"
+                if arrow == "->>":
+                    msg_type = "sync"
+                elif arrow == "-->>":
+                    msg_type = "return"
+                else:
+                    msg_type = "async"
+                message_rows.append((source, target, msg_type, label.strip()))
+                actor_lookup.setdefault(source, {"name": source})
+                actor_lookup.setdefault(target, {"name": target})
+
+        x = 100
+        for actor_id, data in actor_lookup.items():
+            actor = SequenceActor(self.canvas, x, 60, data["name"], self)
+            actor.actor_id = actor_id
+            self.sequence_actors.append(actor)
+            x += 180
+
+        actor_objects = {getattr(actor, "actor_id", actor.name): actor for actor in self.sequence_actors}
+        for index, (source, target, msg_type, label) in enumerate(message_rows):
+            if source in actor_objects and target in actor_objects:
+                self.sequence_messages.append(
+                    SequenceMessage(self.canvas, actor_objects[source], actor_objects[target], msg_type, label, index, self)
+                )
+
+        self.update_scroll_region()
+        self.update_status(f"Loaded sequence diagram with {len(self.sequence_actors)} participants")
+
+    def parse_state_diagram(self, mermaid_code):
+        lines = [line.strip() for line in mermaid_code.split('\n') if line.strip()]
+        state_names = []
+        transitions = []
+
+        for line in lines:
+            if line.startswith("stateDiagram"):
+                continue
+            state_match = re.match(r'state\s+([A-Za-z0-9_]+)', line)
+            if state_match:
+                state_names.append(state_match.group(1))
+                continue
+            trans_match = re.match(r'([A-Za-z0-9_]+)\s*-->\s*([A-Za-z0-9_]+)(?:\s*:\s*(.+))?', line)
+            if trans_match:
+                source, target, label = trans_match.groups()
+                transitions.append((source, target, (label or "").strip()))
+                if source not in state_names:
+                    state_names.append(source)
+                if target not in state_names:
+                    state_names.append(target)
+
+        x, y = 150, 150
+        state_lookup = {}
+        for index, state_name in enumerate(state_names):
+            state = StateNode(self.canvas, x, y, state_name, self)
+            self.state_nodes.append(state)
+            state_lookup[state_name] = state
+            x += 220
+            if (index + 1) % 3 == 0:
+                x = 150
+                y += 140
+
+        for source, target, label in transitions:
+            if source in state_lookup and target in state_lookup:
+                self.state_transitions.append(StateTransition(self.canvas, state_lookup[source], state_lookup[target], label, self))
+
+        self.update_scroll_region()
+        self.update_status(f"Loaded state diagram with {len(self.state_nodes)} states")
+
+    def parse_er_diagram(self, mermaid_code):
+        lines = [line.rstrip() for line in mermaid_code.split('\n') if line.strip()]
+        entity_blocks = {}
+        relationships = []
+        current_entity = None
+
+        for raw_line in lines:
+            line = raw_line.strip()
+            if line.startswith("erDiagram"):
+                continue
+
+            entity_start = re.match(r'([A-Za-z0-9_]+)\s*\{', line)
+            if entity_start:
+                current_entity = entity_start.group(1)
+                entity_blocks.setdefault(current_entity, [])
+                continue
+
+            if line == "}":
+                current_entity = None
+                continue
+
+            if current_entity:
+                entity_blocks[current_entity].append(line)
+                continue
+
+            rel_match = re.match(r'([A-Za-z0-9_]+)\s+(\|\|--\|\||\|\|--o\{|\}o--o\{)\s+([A-Za-z0-9_]+)(?:\s*:\s*(.+))?', line)
+            if rel_match:
+                left, symbol, right, label = rel_match.groups()
+                rel_type_map = {
+                    "||--||": "one-to-one",
+                    "||--o{": "one-to-many",
+                    "}o--o{": "many-to-many"
+                }
+                relationships.append((left, right, rel_type_map.get(symbol, "one-to-many"), (label or "").strip()))
+                entity_blocks.setdefault(left, [])
+                entity_blocks.setdefault(right, [])
+
+        x, y = 150, 150
+        entity_lookup = {}
+        for index, (entity_name, attrs) in enumerate(entity_blocks.items()):
+            entity = EREntity(self.canvas, x, y, entity_name, self)
+            entity.attributes = attrs
+            self.er_entities.append(entity)
+            entity_lookup[entity_name] = entity
+            x += 240
+            if (index + 1) % 3 == 0:
+                x = 150
+                y += 170
+
+        for left, right, rel_type, label in relationships:
+            if left in entity_lookup and right in entity_lookup:
+                self.er_relationships.append(ERRelationship(self.canvas, entity_lookup[left], entity_lookup[right], rel_type, label, self))
+
+        self.update_scroll_region()
+        self.update_status(f"Loaded ER diagram with {len(self.er_entities)} entities")
+    
+    def parse_class_diagram(self, mermaid_code, apply_auto_layout=True):
+        """Parse Mermaid class diagram code and create visual elements"""
         lines = [line.strip() for line in mermaid_code.split('\n') if line.strip()]
         
         # Find classDiagram declaration
@@ -2226,6 +5246,7 @@ class MermaidDiagramTool:
             self.apply_hierarchical_layout()
         
         self.update_scroll_region()
+        self.ensure_grid_behind()
     
     def calculate_class_positions(self, num_classes):
         """Calculate positions for imported classes using hierarchical layout"""
@@ -2519,6 +5540,101 @@ class MermaidDiagramTool:
         return not (right1 < left2 or right2 < left1 or bottom1 < top2 or bottom2 < top1)
     
     def generate_mermaid(self):
+        if self.diagram_type == "flowchart":
+            return self.generate_flowchart()
+        if self.diagram_type == "sequenceDiagram":
+            return self.generate_sequence_diagram()
+        if self.diagram_type == "stateDiagram":
+            return self.generate_state_diagram()
+        if self.diagram_type == "erDiagram":
+            return self.generate_er_diagram()
+        else:
+            return self.generate_class_diagram()
+    
+    def generate_flowchart(self):
+        lines = ["flowchart TD"]
+        
+        # Add nodes
+        for node in self.flowchart_nodes:
+            if node.shape == "rectangle":
+                lines.append(f"    {node.node_id}[{node.text}]")
+            elif node.shape == "rounded":
+                lines.append(f"    {node.node_id}({node.text})")
+            elif node.shape == "diamond":
+                lines.append(f"    {node.node_id}{{{node.text}}}")
+            elif node.shape == "circle":
+                lines.append(f"    {node.node_id}(({node.text}))")
+        
+        flow_symbol_map = {
+            "arrow": "-->",
+            "line": "---",
+            "dotted": "-.->",
+            "thick": "==>"
+        }
+        for connection in self.flowchart_connections:
+            symbol = flow_symbol_map.get(connection.conn_type, "-->")
+            line = f"    {connection.from_node.node_id} {symbol}"
+            if connection.label:
+                line += f"|{connection.label}|"
+            line += f" {connection.to_node.node_id}"
+            lines.append(line)
+        
+        return '\n'.join(lines)
+
+    def generate_sequence_diagram(self):
+        lines = ["sequenceDiagram"]
+        for actor in self.sequence_actors:
+            actor_name = actor.name.replace("\n", " ").strip() or "Actor"
+            actor_id = getattr(actor, "actor_id", actor_name.replace(" ", "_"))
+            lines.append(f"    participant {actor_id} as {actor_name}")
+        arrow_map = {
+            "sync": "->>",
+            "async": "-->",
+            "return": "-->>",
+            "note": "--"
+        }
+        for message in self.sequence_messages:
+            source = getattr(message.from_actor, "actor_id", message.from_actor.name.replace(" ", "_"))
+            target = getattr(message.to_actor, "actor_id", message.to_actor.name.replace(" ", "_"))
+            symbol = arrow_map.get(message.msg_type, "->>")
+            lines.append(f"    {source} {symbol} {target} : {message.label}")
+        return '\n'.join(lines)
+
+    def generate_state_diagram(self):
+        lines = ["stateDiagram-v2"]
+        for state in self.state_nodes:
+            state_name = state.name.replace("\n", " ").strip() or "State"
+            lines.append(f"    state {state_name}")
+        for transition in self.state_transitions:
+            line = f"    {transition.from_state.name} --> {transition.to_state.name}"
+            if transition.label:
+                line += f" : {transition.label}"
+            lines.append(line)
+        return '\n'.join(lines)
+
+    def generate_er_diagram(self):
+        lines = ["erDiagram"]
+        for entity in self.er_entities:
+            entity_name = entity.name.replace(" ", "_").upper() or "ENTITY"
+            lines.append(f"    {entity_name} {{")
+            for attr in entity.attributes:
+                lines.append(f"        {attr}")
+            lines.append("    }")
+        symbol_map = {
+            "one-to-one": "||--||",
+            "one-to-many": "||--o{",
+            "many-to-many": "}o--o{"
+        }
+        for relation in self.er_relationships:
+            left = relation.from_entity.name.replace(" ", "_").upper()
+            right = relation.to_entity.name.replace(" ", "_").upper()
+            line = f"    {left} {symbol_map.get(relation.rel_type, '||--o{')} {right}"
+            if relation.label:
+                line += f" : {relation.label}"
+            lines.append(line)
+        return '\n'.join(lines)
+    
+    def generate_class_diagram(self):
         lines = ["classDiagram"]
         
         # Add classes with enhanced features
@@ -2556,32 +5672,45 @@ class MermaidDiagramTool:
             from_name = rel.from_class.name.replace(" ", "_")
             to_name = rel.to_class.name.replace(" ", "_")
             
-            # Build relationship line with multiplicities and labels
-            rel_line = f"    {from_name}"
-            
-            # Add from multiplicity
-            if rel.from_multiplicity:
-                rel_line += f" \"{rel.from_multiplicity}\""
-            
-            # Add relationship symbol
             if rel.rel_type == "inheritance":
+                rel_line = f"    {to_name}"
+                if rel.to_multiplicity:
+                    rel_line += f" \"{rel.to_multiplicity}\""
                 rel_line += " <|--"
-            elif rel.rel_type == "composition":
-                rel_line += " *--"
-            elif rel.rel_type == "aggregation":
-                rel_line += " o--"
-            elif rel.rel_type == "dependency":
-                rel_line += " <.."
+                if rel.from_multiplicity:
+                    rel_line += f" \"{rel.from_multiplicity}\""
+                rel_line += f" {from_name}"
             elif rel.rel_type == "realization":
+                rel_line = f"    {to_name}"
+                if rel.to_multiplicity:
+                    rel_line += f" \"{rel.to_multiplicity}\""
                 rel_line += " <|.."
-            else:  # association
-                rel_line += " -->"
-            
-            # Add to multiplicity
-            if rel.to_multiplicity:
-                rel_line += f" \"{rel.to_multiplicity}\""
-            
-            rel_line += f" {to_name}"
+                if rel.from_multiplicity:
+                    rel_line += f" \"{rel.from_multiplicity}\""
+                rel_line += f" {from_name}"
+            else:
+                # Build relationship line with multiplicities and labels
+                rel_line = f"    {from_name}"
+                
+                # Add from multiplicity
+                if rel.from_multiplicity:
+                    rel_line += f" \"{rel.from_multiplicity}\""
+                
+                # Add relationship symbol
+                if rel.rel_type == "composition":
+                    rel_line += " *--"
+                elif rel.rel_type == "aggregation":
+                    rel_line += " o--"
+                elif rel.rel_type == "dependency":
+                    rel_line += " <.."
+                else:  # association
+                    rel_line += " -->"
+                
+                # Add to multiplicity
+                if rel.to_multiplicity:
+                    rel_line += f" \"{rel.to_multiplicity}\""
+                
+                rel_line += f" {to_name}"
             
             # Add relationship label
             if rel.label:
@@ -2604,11 +5733,75 @@ class MermaidDiagramTool:
         
         return member
     
-    def save_positions(self, mermaid_file):
-        """Save class positions to a companion JSON file (normalized to zoom 1.0)"""
-        import json
-        
-        # Create position file path (same name with .positions.json extension)
+    def _read_text_file(self, filename):
+        """Read a diagram file using a small set of fallback encodings."""
+        encodings = ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252', 'iso-8859-1']
+
+        for encoding in encodings:
+            try:
+                with open(filename, 'r', encoding=encoding) as f:
+                    return f.read()
+            except UnicodeDecodeError:
+                continue
+
+        raise UnicodeDecodeError("text", b"", 0, 1, "Could not decode file with supported encodings")
+
+    def load_diagram_from_file(self, filename, prompt_for_unsaved=True, show_errors=True):
+        """Load a Mermaid file and restore any saved layout metadata."""
+        if prompt_for_unsaved and self.has_unsaved_changes:
+            response = messagebox.askyesnocancel(
+                "Unsaved Changes",
+                "You have unsaved changes. Do you want to save before opening a new file?"
+            )
+
+            if response is None:
+                return False
+            if response:
+                self.save_mermaid()
+                if self.has_unsaved_changes:
+                    return False
+
+        try:
+            content = self._read_text_file(filename)
+            mermaid_code = self.extract_mermaid_code(content)
+            if not mermaid_code:
+                raise ValueError("No valid Mermaid diagram found in file")
+
+            positions = self.load_positions(filename)
+            if positions and positions.get("zoom_level", 0) > 0:
+                self.set_zoom_level(positions["zoom_level"])
+            else:
+                self.set_zoom_level(1.0)
+
+            self.parse_mermaid(mermaid_code, apply_auto_layout=(positions is None))
+
+            if positions:
+                self.apply_positions(positions, skip_zoom=True)
+                self.update_status(f"Loaded from {os.path.basename(filename)} (with saved positions)")
+            else:
+                self.update_status(f"Loaded from {os.path.basename(filename)} (auto-layout applied)")
+
+            self.current_file = filename
+            self.mark_as_saved()
+            self.save_last_file_path()
+            return True
+        except UnicodeDecodeError:
+            if show_errors:
+                messagebox.showerror("Error", "Could not decode file. Please ensure it's a text file.")
+            return False
+        except Exception as e:
+            if show_errors:
+                messagebox.showerror("Error", f"Failed to open file: {str(e)}")
+            else:
+                self.log_warning(f"Could not load diagram '{filename}': {e}")
+            return False
+
+    def save_positions(self, mermaid_file=None):
+        """Save element positions to a companion JSON file (normalized to zoom 1.0)."""
+        mermaid_file = mermaid_file or self.current_file
+        if not mermaid_file:
+            return False
+
         position_file = mermaid_file + ".positions.json"
         
         # Get current canvas scroll position (viewport)
@@ -2622,8 +5815,12 @@ class MermaidDiagramTool:
                 "yview": list(canvas_yview)
             },
             "classes": {},
+            "flowchart_nodes": {},
+            "sequence_actors": {},
+            "state_nodes": {},
+            "er_entities": {},
             "metadata": {
-                "version": "1.2",  # Updated version for normalized coordinates
+                "version": "1.3",
                 "saved_at": str(os.path.getmtime(mermaid_file)) if os.path.exists(mermaid_file) else ""
             }
         }
@@ -2644,77 +5841,121 @@ class MermaidDiagramTool:
                     "width": float(normalized_width),
                     "height": float(normalized_height)
                 }
-                print(f"Debug: Saving {class_name} at normalized ({normalized_x:.1f}, {normalized_y:.1f}) from actual ({class_box.x:.1f}, {class_box.y:.1f}) at zoom {self.zoom_level}")
+                self.log_debug(
+                    f"Saving {class_name} at normalized ({normalized_x:.1f}, {normalized_y:.1f}) "
+                    f"from actual ({class_box.x:.1f}, {class_box.y:.1f}) at zoom {self.zoom_level}"
+                )
             except Exception as e:
-                print(f"Warning: Could not save position for class {class_box.name}: {e}")
+                self.log_warning(f"Could not save position for class {class_box.name}: {e}")
                 continue
+
+        for node in self.flowchart_nodes:
+            try:
+                normalized_x = node.x / self.zoom_level if self.zoom_level > 0 else node.x
+                normalized_y = node.y / self.zoom_level if self.zoom_level > 0 else node.y
+                positions["flowchart_nodes"][node.node_id] = {
+                    "x": float(normalized_x),
+                    "y": float(normalized_y)
+                }
+            except Exception as e:
+                self.log_warning(f"Could not save position for node {node.node_id}: {e}")
+                continue
+
+        for actor in self.sequence_actors:
+            actor_id = getattr(actor, "actor_id", actor.name.replace(" ", "_"))
+            positions["sequence_actors"][actor_id] = {
+                "x": float(actor.x / self.zoom_level if self.zoom_level > 0 else actor.x),
+                "y": float(actor.y / self.zoom_level if self.zoom_level > 0 else actor.y)
+            }
+
+        for state in self.state_nodes:
+            positions["state_nodes"][state.name] = {
+                "x": float(state.x / self.zoom_level if self.zoom_level > 0 else state.x),
+                "y": float(state.y / self.zoom_level if self.zoom_level > 0 else state.y)
+            }
+
+        for entity in self.er_entities:
+            entity_key = entity.name.replace(" ", "_").upper()
+            positions["er_entities"][entity_key] = {
+                "x": float(entity.x / self.zoom_level if self.zoom_level > 0 else entity.x),
+                "y": float(entity.y / self.zoom_level if self.zoom_level > 0 else entity.y)
+            }
         
         try:
-            with open(position_file, 'w') as f:
+            with open(position_file, 'w', encoding='utf-8') as f:
                 json.dump(positions, f, indent=2)
-            print(f"Debug: Saved {len(positions['classes'])} class positions to {position_file}")
+            self.log_debug(f"Saved positions to {position_file}")
+            return True
         except Exception as e:
-            print(f"Warning: Could not save positions file: {e}")
+            self.log_warning(f"Could not save positions file: {e}")
             # Don't show error to user - position saving is optional
+            return False
     
     def load_positions(self, mermaid_file):
-        """Load class positions from companion JSON file"""
-        import json
-        
+        """Load element positions from a companion JSON file."""
         # Create position file path
         position_file = mermaid_file + ".positions.json"
         
-        print(f"Debug: Looking for position file: {position_file}")
+        self.log_debug(f"Looking for position file: {position_file}")
         
         if not os.path.exists(position_file):
             # Position file doesn't exist - this is normal for old diagrams
-            print(f"Debug: Position file not found")
+            self.log_debug("Position file not found")
             return None
         
-        print(f"Debug: Position file found, loading...")
+        self.log_debug("Position file found, loading...")
         
         try:
-            with open(position_file, 'r') as f:
+            with open(position_file, 'r', encoding='utf-8') as f:
                 positions = json.load(f)
-            print(f"Debug: Successfully loaded positions with {len(positions.get('classes', {}))} classes")
+            self.log_debug(f"Successfully loaded positions with {len(positions.get('classes', {}))} classes")
             return positions
         except json.JSONDecodeError as e:
             # Invalid JSON - silently ignore and use default layout
-            print(f"Warning: Could not parse position file (invalid JSON): {e}")
+            self.log_warning(f"Could not parse position file (invalid JSON): {e}")
             return None
         except Exception as e:
             # Other errors - silently ignore
-            print(f"Warning: Could not load positions: {e}")
+            self.log_warning(f"Could not load positions: {e}")
             return None
     
     def apply_positions(self, positions, skip_zoom=False):
-        """Apply saved positions to classes (positions are normalized to zoom 1.0)"""
+        """Apply saved positions to diagram elements."""
         if not positions:
-            print("Debug: No positions to apply")
+            self.log_debug("No positions to apply")
             return
         
-        if "classes" not in positions:
-            print("Warning: Position file missing 'classes' data")
+        class_positions = positions.get("classes", {})
+        node_positions = positions.get("flowchart_nodes", {})
+        actor_positions = positions.get("sequence_actors", {})
+        state_positions = positions.get("state_nodes", {})
+        entity_positions = positions.get("er_entities", {})
+
+        if not class_positions and not node_positions and not actor_positions and not state_positions and not entity_positions:
+            self.log_warning("Position file missing supported element data")
             return
-        
-        print(f"Debug: Applying positions for {len(positions['classes'])} classes")
-        print(f"Debug: Current zoom level: {self.zoom_level}")
+
+        self.log_debug(
+            f"Applying positions for {len(class_positions)} classes, {len(node_positions)} flowchart nodes, "
+            f"{len(actor_positions)} actors, {len(state_positions)} states and {len(entity_positions)} entities"
+        )
+        self.log_debug(f"Current zoom level: {self.zoom_level}")
         
         try:
             # Apply zoom level if saved (unless we already did it)
             if not skip_zoom and "zoom_level" in positions:
                 saved_zoom = positions["zoom_level"]
-                print(f"Debug: Saved zoom level: {saved_zoom}")
+                self.log_debug(f"Saved zoom level: {saved_zoom}")
                 if saved_zoom > 0:
-                    print(f"Debug: Setting zoom level to: {saved_zoom}")
+                    self.log_debug(f"Setting zoom level to: {saved_zoom}")
                     self.set_zoom_level(saved_zoom)
             
             # Apply positions to each class (scale from normalized to current zoom)
             applied_count = 0
             for class_box in self.classes:
                 class_name = class_box.name.replace(" ", "_")
-                if class_name in positions["classes"]:
-                    pos = positions["classes"][class_name]
+                if class_name in class_positions:
+                    pos = class_positions[class_name]
                     
                     # Validate position data
                     if "x" in pos and "y" in pos:
@@ -2728,33 +5969,104 @@ class MermaidDiagramTool:
                         dy = target_y - class_box.y
                         class_box.move(dx, dy)
                         applied_count += 1
-                        print(f"Debug: Moved {class_name} from ({old_x:.1f}, {old_y:.1f}) to ({class_box.x:.1f}, {class_box.y:.1f}) [normalized: ({pos['x']:.1f}, {pos['y']:.1f})]")
+                        self.log_debug(
+                            f"Moved {class_name} from ({old_x:.1f}, {old_y:.1f}) to ({class_box.x:.1f}, {class_box.y:.1f}) "
+                            f"[normalized: ({pos['x']:.1f}, {pos['y']:.1f})]"
+                        )
                 else:
-                    print(f"Debug: No saved position for class '{class_name}'")
-            
-            print(f"Debug: Applied positions to {applied_count}/{len(self.classes)} classes")
+                    self.log_debug(f"No saved position for class '{class_name}'")
+
+            applied_nodes = 0
+            for node in self.flowchart_nodes:
+                if node.node_id in node_positions:
+                    pos = node_positions[node.node_id]
+                    if "x" in pos and "y" in pos:
+                        dx = (pos["x"] * self.zoom_level) - node.x
+                        dy = (pos["y"] * self.zoom_level) - node.y
+                        node.x += dx
+                        node.y += dy
+                        self.canvas.move(node.shape_item, dx, dy)
+                        self.canvas.move(node.text_item, dx, dy)
+                        applied_nodes += 1
+
+            for actor in self.sequence_actors:
+                actor_id = getattr(actor, "actor_id", actor.name.replace(" ", "_"))
+                if actor_id in actor_positions:
+                    pos = actor_positions[actor_id]
+                    dx = (pos["x"] * self.zoom_level) - actor.x
+                    dy = (pos["y"] * self.zoom_level) - actor.y
+                    actor.x += dx
+                    actor.y += dy
+                    self.canvas.move(actor.box, dx, dy)
+                    self.canvas.move(actor.text_item, dx, dy)
+                    self.canvas.move(actor.lifeline, dx, dy)
+
+            for state in self.state_nodes:
+                if state.name in state_positions:
+                    pos = state_positions[state.name]
+                    dx = (pos["x"] * self.zoom_level) - state.x
+                    dy = (pos["y"] * self.zoom_level) - state.y
+                    state.x += dx
+                    state.y += dy
+                    self.canvas.move(state.box, dx, dy)
+                    self.canvas.move(state.text_item, dx, dy)
+
+            for entity in self.er_entities:
+                entity_key = entity.name.replace(" ", "_").upper()
+                if entity_key in entity_positions:
+                    pos = entity_positions[entity_key]
+                    dx = (pos["x"] * self.zoom_level) - entity.x
+                    dy = (pos["y"] * self.zoom_level) - entity.y
+                    entity.x += dx
+                    entity.y += dy
+                    self.canvas.move(entity.box, dx, dy)
+                    self.canvas.move(entity.text_item, dx, dy)
+
+            self.log_debug(
+                f"Applied positions to {applied_count}/{len(self.classes)} classes and "
+                f"{applied_nodes}/{len(self.flowchart_nodes)} nodes"
+            )
             
             # Update relationships after moving classes
             self.update_relationships()
             self.update_scroll_region()
+            self.restore_canvas_viewport(positions.get("canvas_viewport"))
         except Exception as e:
-            print(f"Warning: Error applying positions: {e}")
+            self.log_warning(f"Error applying positions: {e}")
             # Continue anyway - diagram will use default positions
+
+    def restore_canvas_viewport(self, viewport):
+        """Restore the saved viewport after the scroll region is ready."""
+        if not viewport:
+            return
+
+        xview = viewport.get("xview")
+        yview = viewport.get("yview")
+
+        def apply_view():
+            if xview and len(xview) >= 1:
+                self.canvas.xview_moveto(xview[0])
+            if yview and len(yview) >= 1:
+                self.canvas.yview_moveto(yview[0])
+
+        self.root.after_idle(apply_view)
     
     def mark_as_changed(self):
         """Mark the diagram as having unsaved changes"""
         if not self.has_unsaved_changes:
             self.has_unsaved_changes = True
             self.update_window_title()
+        self.refresh_ui_feedback()
     
     def mark_as_saved(self):
         """Mark the diagram as saved"""
         self.has_unsaved_changes = False
         self.update_window_title()
+        self.refresh_ui_feedback()
     
     def update_window_title(self):
         """Update window title to show current file and unsaved changes"""
-        title = "Mermaid UML Class Diagram Tool"
+        title = f"Mermaid {self.get_diagram_display_name()} Tool"
         if self.current_file:
             import os
             filename = os.path.basename(self.current_file)
@@ -2770,7 +6082,7 @@ class MermaidDiagramTool:
                 with open(self.config_file, 'w', encoding='utf-8') as f:
                     f.write(self.current_file)
             except Exception as e:
-                print(f"Could not save config: {e}")
+                self.log_warning(f"Could not save config: {e}")
     
     def load_last_file_path(self):
         """Load the last opened file path from config"""
@@ -2779,55 +6091,14 @@ class MermaidDiagramTool:
                 with open(self.config_file, 'r', encoding='utf-8') as f:
                     return f.read().strip()
         except Exception as e:
-            print(f"Could not load config: {e}")
+            self.log_warning(f"Could not load config: {e}")
         return None
     
     def load_last_diagram(self):
         """Load the last used diagram on startup"""
         last_file = self.load_last_file_path()
         if last_file and os.path.exists(last_file):
-            try:
-                # Try multiple encodings
-                content = None
-                encodings = ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252', 'iso-8859-1']
-                
-                for encoding in encodings:
-                    try:
-                        with open(last_file, 'r', encoding=encoding) as f:
-                            content = f.read()
-                        break  # Success
-                    except UnicodeDecodeError:
-                        continue
-                
-                if content is None:
-                    print(f"Could not decode last diagram file: {last_file}")
-                    return
-                
-                mermaid_code = self.extract_mermaid_code(content)
-                if mermaid_code:
-                    # Check if position file exists before parsing
-                    positions = self.load_positions(last_file)
-                    
-                    # Set zoom level BEFORE parsing if we have saved positions (don't move classes)
-                    if positions and "zoom_level" in positions:
-                        saved_zoom = positions["zoom_level"]
-                        if saved_zoom > 0:
-                            print(f"Debug: Setting zoom level to: {saved_zoom}")
-                            self.set_zoom_level(saved_zoom)
-                    
-                    # Parse diagram (skip auto-layout if we have saved positions)
-                    self.parse_mermaid(mermaid_code, apply_auto_layout=(positions is None))
-                    
-                    # Apply saved positions if they exist (but skip zoom since we already did it)
-                    if positions:
-                        self.apply_positions(positions, skip_zoom=True)
-                    
-                    self.current_file = last_file
-                    self.has_unsaved_changes = False
-                    self.update_window_title()
-                    self.update_status(f"Loaded: {os.path.basename(last_file)}")
-            except Exception as e:
-                print(f"Could not load last diagram: {e}")
+            self.load_diagram_from_file(last_file, prompt_for_unsaved=False, show_errors=False)
     
     def on_closing(self):
         """Handle window close event"""
@@ -2849,7 +6120,7 @@ class MermaidDiagramTool:
             try:
                 self.save_positions(self.current_file)
             except Exception as e:
-                print(f"Warning: Could not save positions on exit: {e}")
+                self.log_warning(f"Could not save positions on exit: {e}")
         
         # Save the last file path
         self.save_last_file_path()

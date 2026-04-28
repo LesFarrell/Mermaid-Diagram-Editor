@@ -21,6 +21,13 @@ A visual drag-and-drop tool for creating UML class diagrams that exports to Merm
 python mermaid_diagram_tool.py
 ```
 
+### Sample Diagrams
+- `sample_class_diagram.md`
+- `sample_flowchart.md`
+- `sample_sequence_diagram.md`
+- `sample_state_diagram.md`
+- `sample_er_diagram.md`
+
 ### Creating Classes
 - Click "Add Class" button to create a new class (auto-selected)
 - Right-click on canvas to create a class at that position (auto-selected)
