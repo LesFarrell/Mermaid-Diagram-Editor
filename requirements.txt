@@ -1,5 +1,7 @@
-# No external dependencies required - uses built-in tkinter
-# This tool uses only Python standard library modules:
-# - tkinter (GUI framework)
-# - json (for saving/loading diagrams)
-# - math (for relationship arrow calculations)
+# Core app: tkinter ships with standard Python on Windows installs.
+#
+# Required for PNG export and render-check scripts:
+Pillow>=10.4.0
+#
+# Recommended for Mermaid-aligned SVG sequence participant icons:
+tksvg>=0.7.4

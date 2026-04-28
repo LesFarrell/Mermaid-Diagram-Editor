@@ -1,9 +1,25 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
+import tkinter.font as tkfont
+import html
 import json
 import math
 import re
 import os
+import tempfile
+
+try:
+    from PIL import Image, ImageColor, ImageDraw, ImageFont
+except ImportError:
+    Image = None
+    ImageColor = None
+    ImageDraw = None
+    ImageFont = None
+
+try:
+    from tksvg import SvgImage
+except ImportError:
+    SvgImage = None
 
 
 def get_label_perpendicular_vector(from_point, to_point, side=1):
@@ -57,6 +73,145 @@ def get_endpoint_label_position(point, other_point, along_offset, perpendicular_
 def get_centered_text_width(width, ratio, minimum=40):
     """Compute a reasonable wrapped text width inside a scaled shape."""
     return max(minimum, int(width * ratio))
+
+
+def unquote_mermaid_string(value):
+    """Remove a single layer of Mermaid/JSON-style quotes from a value."""
+    if value is None:
+        return None
+    text = value.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+        return text[1:-1]
+    return text
+
+
+def split_er_entity_reference(reference):
+    """Split an ER entity reference into identifier and optional display alias."""
+    text = reference.strip()
+    alias_match = re.match(r'(.+?)\[(.+)\]$', text)
+    if alias_match:
+        entity_id = unquote_mermaid_string(alias_match.group(1).strip())
+        entity_alias = unquote_mermaid_string(alias_match.group(2).strip())
+        return entity_id, entity_alias
+    cleaned = unquote_mermaid_string(text)
+    return cleaned, None
+
+
+def parse_sequence_participant_config(config_text):
+    """Extract supported fields from Mermaid's inline sequence participant config."""
+    parsed = {"type": None, "alias": None}
+    if not config_text:
+        return parsed
+
+    type_match = re.search(r'"type"\s*:\s*"([^"]+)"', config_text)
+    alias_match = re.search(r'"alias"\s*:\s*"([^"]+)"', config_text)
+    if type_match:
+        parsed["type"] = type_match.group(1).strip()
+    if alias_match:
+        parsed["alias"] = alias_match.group(1).strip()
+    return parsed
+
+
+SEQUENCE_BASE_ARROWS = [
+    "<<-->>",
+    "<<->>",
+    "-->>",
+    "->>",
+    "--|\\",
+    "-|\\",
+    "--|/",
+    "-|/",
+    "/|--",
+    "/|-",
+    "\\\\--",
+    "\\\\-",
+    "--\\\\",
+    "-\\\\",
+    "--//",
+    "-//",
+    "//--",
+    "//-",
+    "--x",
+    "-x",
+    "--)",
+    "-)",
+    "-->",
+    "->",
+]
+SEQUENCE_ARROW_PATTERN = "|".join(re.escape(symbol) for symbol in SEQUENCE_BASE_ARROWS)
+SEQUENCE_MESSAGE_RE = re.compile(
+    rf'([A-Za-z0-9_]+)\s*(\(\))?\s*({SEQUENCE_ARROW_PATTERN})\s*(\(\))?\s*([A-Za-z0-9_]+)\s*:\s*(.+)'
+)
+
+
+def normalize_er_cardinality_text(value):
+    """Normalize Mermaid ER cardinality syntax into a compact display value."""
+    normalized = value.strip().lower()
+    mapping = {
+        "|o": "0..1",
+        "o|": "0..1",
+        "||": "1",
+        "}o": "0..N",
+        "o{": "0..N",
+        "}|": "1..N",
+        "|{": "1..N",
+        "one or zero": "0..1",
+        "zero or one": "0..1",
+        "only one": "1",
+        "1": "1",
+        "one or more": "1..N",
+        "one or many": "1..N",
+        "many(1)": "1..N",
+        "1+": "1..N",
+        "zero or more": "0..N",
+        "zero or many": "0..N",
+        "many(0)": "0..N",
+        "0+": "0..N",
+    }
+    return mapping.get(normalized, value.strip())
+
+
+def infer_er_rel_type(from_cardinality, to_cardinality):
+    """Infer the editor's coarse ER relation type from endpoint cardinalities."""
+    many_values = {"0..N", "1..N", "N"}
+    from_is_many = from_cardinality in many_values
+    to_is_many = to_cardinality in many_values
+    if from_is_many and to_is_many:
+        return "many-to-many"
+    if not from_is_many and not to_is_many:
+        return "one-to-one"
+    return "one-to-many"
+
+
+def parse_er_relationship_syntax(relation_text):
+    """Parse Mermaid ER relationship text into visual metadata."""
+    relation = relation_text.strip()
+
+    symbolic_match = re.fullmatch(r'(\|o|\|\||\}o|\}\|)(--|\.\.)(o\||\|\||o\{|\|\{)', relation)
+    if symbolic_match:
+        left_card, separator, right_card = symbolic_match.groups()
+        from_cardinality = normalize_er_cardinality_text(left_card)
+        to_cardinality = normalize_er_cardinality_text(right_card)
+        return {
+            "rel_type": infer_er_rel_type(from_cardinality, to_cardinality),
+            "from_cardinality": from_cardinality,
+            "to_cardinality": to_cardinality,
+            "identifying": separator == "--",
+        }
+
+    textual_match = re.fullmatch(r'(.+?)\s+(optionally to|to)\s+(.+)', relation, flags=re.IGNORECASE)
+    if textual_match:
+        left_card, connector, right_card = textual_match.groups()
+        from_cardinality = normalize_er_cardinality_text(left_card)
+        to_cardinality = normalize_er_cardinality_text(right_card)
+        return {
+            "rel_type": infer_er_rel_type(from_cardinality, to_cardinality),
+            "from_cardinality": from_cardinality,
+            "to_cardinality": to_cardinality,
+            "identifying": connector.lower() == "to",
+        }
+
+    return None
 
 
 def get_outside_box_label_position(center_point, edge_point, other_point, outward_offset, along_offset=0):
@@ -266,6 +421,8 @@ class ClassBox:
         self.x = x
         self.y = y
         self.name = name
+        self.class_id = name.replace(" ", "_")
+        self.display_label = name
         self.attributes = []
         self.methods = []
         self.annotations = []  # Class annotations like @interface, @abstract
@@ -1766,51 +1923,507 @@ class SequenceActor:
         self.x = x
         self.y = y
         self.name = name
-        self.width = 80
-        self.height = 40
+        self.actor_id = name.replace(" ", "_")
+        self.actor_kind = "participant"
+        self.participant_type = None
+        self.width = 110
+        self.height = 56
         self.selected = False
         self.drag_data = {"x": 0, "y": 0}
         self.create_visual()
     
+    def get_render_type(self):
+        participant_type = (self.participant_type or "").strip().lower()
+        if participant_type:
+            return participant_type
+        if self.actor_kind == "actor":
+            return "actor"
+        return "participant"
+
+    def get_visual_metrics(self, zoom_level):
+        render_type = self.get_render_type()
+        width = self.width * zoom_level
+        if render_type in {"actor", "boundary", "control", "entity"}:
+            height = max(72, int(80 * zoom_level))
+        elif render_type == "database":
+            height = max(60, int(68 * zoom_level))
+        elif render_type == "collections":
+            height = max(56, int(62 * zoom_level))
+        elif render_type == "queue":
+            height = max(56, int(62 * zoom_level))
+        else:
+            height = max(40, int(46 * zoom_level))
+        return width, height
+
+    def supports_svg_icon(self):
+        return (
+            SvgImage is not None
+            and self.get_render_type() in {"actor", "boundary", "control", "entity", "database", "collections", "queue"}
+        )
+
+    def get_svg_icon_bounds(self, x, y, w, h, zoom_level):
+        render_type = self.get_render_type()
+        if render_type == "actor":
+            icon_w = min(w, max(42, int(50 * zoom_level)))
+            icon_h = min(h, max(56, int(62 * zoom_level)))
+        elif render_type in {"boundary", "control", "entity"}:
+            icon_w = min(w, max(54, int(60 * zoom_level)))
+            icon_h = min(h, max(50, int(56 * zoom_level)))
+        elif render_type == "database":
+            icon_w = min(w, max(74, int(82 * zoom_level)))
+            icon_h = min(h, max(48, int(54 * zoom_level)))
+        elif render_type == "collections":
+            icon_w = min(w, max(74, int(82 * zoom_level)))
+            icon_h = min(h, max(46, int(50 * zoom_level)))
+        else:
+            icon_w = min(w, max(72, int(80 * zoom_level)))
+            icon_h = min(h, max(44, int(48 * zoom_level)))
+        icon_x = x + max(0, (w - icon_w) / 2)
+        return icon_x, y, icon_w, icon_h
+
+    def build_sequence_participant_svg(self, render_type, width, height):
+        stroke = "#111111"
+        soft_fill = "#eaf5f8"
+        stroke_width = max(2.0, min(width, height) * 0.06)
+        common = f'stroke="{stroke}" stroke-width="{stroke_width:.2f}" stroke-linecap="round" stroke-linejoin="round"'
+
+        if render_type == "actor":
+            head_r = width * 0.16
+            cx = width / 2
+            head_cy = max(head_r + 2, height * 0.2)
+            torso_top = head_cy + head_r
+            torso_bottom = height * 0.64
+            arm_y = height * 0.44
+            leg_y = height * 0.94
+            arm_half = width * 0.32
+            leg_half = width * 0.24
+            body = [
+                f'<circle cx="{cx:.2f}" cy="{head_cy:.2f}" r="{head_r:.2f}" fill="none" {common} />',
+                f'<line x1="{cx:.2f}" y1="{torso_top:.2f}" x2="{cx:.2f}" y2="{torso_bottom:.2f}" {common} />',
+                f'<line x1="{cx - arm_half:.2f}" y1="{arm_y:.2f}" x2="{cx + arm_half:.2f}" y2="{arm_y:.2f}" {common} />',
+                f'<line x1="{cx:.2f}" y1="{torso_bottom:.2f}" x2="{cx - leg_half:.2f}" y2="{leg_y:.2f}" {common} />',
+                f'<line x1="{cx:.2f}" y1="{torso_bottom:.2f}" x2="{cx + leg_half:.2f}" y2="{leg_y:.2f}" {common} />',
+            ]
+        elif render_type == "boundary":
+            radius = min(width, height) * 0.3
+            cx = width * 0.58
+            cy = height * 0.46
+            line_x = cx - radius - width * 0.24
+            body = [
+                f'<line x1="{line_x:.2f}" y1="{cy - radius * 0.95:.2f}" x2="{line_x:.2f}" y2="{cy + radius * 0.95:.2f}" {common} />',
+                f'<line x1="{line_x:.2f}" y1="{cy:.2f}" x2="{cx - radius * 0.42:.2f}" y2="{cy:.2f}" {common} />',
+                f'<circle cx="{cx:.2f}" cy="{cy:.2f}" r="{radius:.2f}" fill="none" {common} />',
+            ]
+        elif render_type == "control":
+            radius = min(width, height) * 0.31
+            cx = width / 2
+            cy = height * 0.46
+            ax1 = cx - radius * 0.82
+            ay1 = cy - radius * 0.88
+            ax2 = cx + radius * 0.9
+            ay2 = cy + radius * 0.78
+            arrow_x = cx + radius * 0.16
+            arrow_y = cy - radius * 0.8
+            body = [
+                f'<circle cx="{cx:.2f}" cy="{cy:.2f}" r="{radius:.2f}" fill="none" {common} />',
+                f'<path d="M {ax1:.2f} {ay1:.2f} A {radius * 0.92:.2f} {radius * 0.92:.2f} 0 1 1 {ax2:.2f} {ay2:.2f}" fill="none" {common} />',
+                f'<line x1="{arrow_x:.2f}" y1="{arrow_y:.2f}" x2="{arrow_x - radius * 0.36:.2f}" y2="{arrow_y + radius * 0.12:.2f}" {common} />',
+                f'<line x1="{arrow_x:.2f}" y1="{arrow_y:.2f}" x2="{arrow_x - radius * 0.14:.2f}" y2="{arrow_y + radius * 0.38:.2f}" {common} />',
+            ]
+        elif render_type == "entity":
+            radius = min(width, height) * 0.31
+            cx = width / 2
+            cy = height * 0.44
+            underline_y = cy + radius + height * 0.12
+            body = [
+                f'<circle cx="{cx:.2f}" cy="{cy:.2f}" r="{radius:.2f}" fill="none" {common} />',
+                f'<line x1="{cx - radius:.2f}" y1="{underline_y:.2f}" x2="{cx + radius:.2f}" y2="{underline_y:.2f}" {common} />',
+            ]
+        elif render_type == "database":
+            rx = width * 0.42
+            left = (width - (rx * 2)) / 2
+            right = left + (rx * 2)
+            top = height * 0.12
+            bottom = height * 0.88
+            ellipse_h = height * 0.22
+            body = [
+                f'<rect x="{left:.2f}" y="{top + ellipse_h / 2:.2f}" width="{(rx * 2):.2f}" height="{(bottom - top - ellipse_h):.2f}" fill="{soft_fill}" stroke="none" />',
+                f'<ellipse cx="{width / 2:.2f}" cy="{top + ellipse_h / 2:.2f}" rx="{rx:.2f}" ry="{ellipse_h / 2:.2f}" fill="{soft_fill}" {common} />',
+                f'<line x1="{left:.2f}" y1="{top + ellipse_h / 2:.2f}" x2="{left:.2f}" y2="{bottom - ellipse_h / 2:.2f}" {common} />',
+                f'<line x1="{right:.2f}" y1="{top + ellipse_h / 2:.2f}" x2="{right:.2f}" y2="{bottom - ellipse_h / 2:.2f}" {common} />',
+                f'<path d="M {left:.2f} {bottom - ellipse_h / 2:.2f} A {rx:.2f} {ellipse_h / 2:.2f} 0 0 0 {right:.2f} {bottom - ellipse_h / 2:.2f}" fill="none" {common} />',
+            ]
+        elif render_type == "collections":
+            pad = width * 0.08
+            offset = width * 0.1
+            box_w = width - pad * 2 - offset
+            box_h = height * 0.64
+            top = height * 0.18
+            body = [
+                f'<rect x="{pad + offset:.2f}" y="{top + offset * 0.45:.2f}" width="{box_w:.2f}" height="{box_h:.2f}" rx="{width * 0.04:.2f}" ry="{width * 0.04:.2f}" fill="{soft_fill}" {common} />',
+                f'<rect x="{pad:.2f}" y="{top:.2f}" width="{box_w:.2f}" height="{box_h:.2f}" rx="{width * 0.04:.2f}" ry="{width * 0.04:.2f}" fill="{soft_fill}" {common} />',
+            ]
+        else:
+            pad = width * 0.08
+            rect_h = height * 0.62
+            top = height * 0.18
+            body = [
+                f'<rect x="{pad:.2f}" y="{top:.2f}" width="{width - pad * 2:.2f}" height="{rect_h:.2f}" rx="{height * 0.18:.2f}" ry="{height * 0.18:.2f}" fill="{soft_fill}" {common} />',
+            ]
+            for ratio in (0.32, 0.5, 0.68):
+                x = pad + (width - pad * 2) * ratio
+                body.append(
+                    f'<line x1="{x:.2f}" y1="{top + rect_h * 0.18:.2f}" x2="{x:.2f}" y2="{top + rect_h * 0.82:.2f}" {common} />'
+                )
+
+        body_markup = "\n        ".join(body)
+        return (
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{int(width)}" height="{int(height)}" '
+            f'viewBox="0 0 {width:.2f} {height:.2f}">'
+            f'\n        {body_markup}\n</svg>'
+        )
+
+    def draw_svg_shape(self, x, y, w, h, zoom_level):
+        render_type = self.get_render_type()
+        icon_x, icon_y, icon_w, icon_h = self.get_svg_icon_bounds(x, y, w, h, zoom_level)
+        svg_markup = self.build_sequence_participant_svg(render_type, icon_w, icon_h)
+        photo = SvgImage(
+            master=self.canvas,
+            data=svg_markup,
+            scaletowidth=max(1, int(round(icon_w))),
+        )
+        self.image_refs.append(photo)
+        image_item = self.register_item(
+            self.canvas.create_image(icon_x, icon_y, anchor="nw", image=photo)
+        )
+        if self.tool:
+            self.tool.canvas_svg_exports[image_item] = {
+                "svg_markup": svg_markup,
+                "x": icon_x,
+                "y": icon_y,
+                "width": icon_w,
+                "height": icon_h,
+                "photo": photo,
+            }
+        self.selection_outline_item = self.register_item(
+            self.canvas.create_rectangle(
+                icon_x - 4,
+                icon_y - 4,
+                icon_x + icon_w + 4,
+                icon_y + icon_h + 4,
+                outline="",
+                width=max(2, int(3 * zoom_level)),
+            )
+        )
+        self.canvas.tag_raise(self.selection_outline_item)
+        self.primary_bbox = (icon_x, icon_y, icon_x + icon_w, icon_y + icon_h)
+        self.box = self.selection_outline_item
+        return icon_x + icon_w / 2, icon_y + icon_h / 2, icon_y + icon_h
+
+    def delete_visual_items(self):
+        if self.tool:
+            for item in getattr(self, "visual_items", []):
+                self.tool.canvas_svg_exports.pop(item, None)
+        for item in getattr(self, "visual_items", []):
+            self.canvas.delete(item)
+        self.visual_items = []
+        self.outline_items = []
+        self.fill_outline_items = []
+        self.image_refs = []
+        self.selection_outline_item = None
+        self.primary_bbox = None
+        self.box = None
+        self.text_item = None
+        self.lifeline = None
+
+    def register_item(self, item, outline=False, fill_outline=False):
+        self.visual_items.append(item)
+        if outline:
+            self.outline_items.append(item)
+        if fill_outline:
+            self.fill_outline_items.append(item)
+        return item
+
+    def draw_participant_shape(self, x, y, w, h, zoom_level):
+        self.box = self.register_item(
+            self.canvas.create_rectangle(
+                x, y, x + w, y + h,
+                fill="#bfe2ee", outline="black", width=max(1, int(2 * zoom_level))
+            ),
+            outline=True,
+        )
+        self.primary_bbox = (x, y, x + w, y + h)
+        return x + w / 2, y + h / 2, y + h
+
+    def draw_collections_shape(self, x, y, w, h, zoom_level):
+        offset = max(6, int(6 * zoom_level))
+        back = self.register_item(
+            self.canvas.create_rectangle(
+                x + offset, y + offset, x + w + offset, y + h + offset,
+                fill="#d9eef5", outline="black", width=max(1, int(2 * zoom_level))
+            ),
+            outline=True,
+        )
+        front = self.register_item(
+            self.canvas.create_rectangle(
+                x, y, x + w, y + h,
+                fill="#bfe2ee", outline="black", width=max(1, int(2 * zoom_level))
+            ),
+            outline=True,
+        )
+        self.box = front
+        self.primary_bbox = self.canvas.bbox(front)
+        return x + w / 2, y + h / 2 + offset / 2, y + h + offset
+
+    def draw_database_shape(self, x, y, w, h, zoom_level):
+        oval_h = max(10, int(14 * zoom_level))
+        self.register_item(
+            self.canvas.create_rectangle(
+                x, y + oval_h / 2, x + w, y + h - oval_h / 2,
+                fill="#bfe2ee", outline="black", width=max(1, int(2 * zoom_level))
+            ),
+            outline=True,
+        )
+        self.register_item(
+            self.canvas.create_oval(
+                x, y, x + w, y + oval_h,
+                fill="#d6edf5", outline="black", width=max(1, int(2 * zoom_level))
+            ),
+            outline=True,
+        )
+        self.register_item(
+            self.canvas.create_arc(
+                x, y + h - oval_h, x + w, y + h,
+                start=180, extent=180, style=tk.ARC, outline="black", width=max(1, int(2 * zoom_level))
+            ),
+            fill_outline=True,
+        )
+        self.primary_bbox = (x, y, x + w, y + h)
+        self.box = self.visual_items[0]
+        return x + w / 2, y + h / 2, y + h
+
+    def draw_queue_shape(self, x, y, w, h, zoom_level):
+        arc_w = max(14, int(18 * zoom_level))
+        self.register_item(
+            self.canvas.create_rectangle(
+                x + arc_w / 2, y, x + w - arc_w / 2, y + h,
+                fill="#bfe2ee", outline="black", width=max(1, int(2 * zoom_level))
+            ),
+            outline=True,
+        )
+        self.register_item(
+            self.canvas.create_arc(
+                x, y, x + arc_w, y + h,
+                start=90, extent=180, style=tk.ARC, outline="black", width=max(1, int(2 * zoom_level))
+            ),
+            fill_outline=True,
+        )
+        self.register_item(
+            self.canvas.create_arc(
+                x + w - arc_w, y, x + w, y + h,
+                start=270, extent=180, style=tk.ARC, outline="black", width=max(1, int(2 * zoom_level))
+            ),
+            fill_outline=True,
+        )
+        for ratio in (0.28, 0.5, 0.72):
+            line_x = x + ratio * w
+            self.register_item(
+                self.canvas.create_line(
+                    line_x, y + h * 0.18, line_x, y + h * 0.82,
+                    fill="black", width=max(1, int(1 * zoom_level))
+                ),
+                fill_outline=True,
+            )
+        self.primary_bbox = (x, y, x + w, y + h)
+        self.box = self.visual_items[0]
+        return x + w / 2, y + h / 2, y + h
+
+    def draw_actor_shape(self, x, y, w, h, zoom_level):
+        center_x = x + w / 2
+        head_r = max(10, int(12 * zoom_level))
+        head_cy = y + head_r + max(2, int(2 * zoom_level))
+        torso_top = head_cy + head_r
+        torso_bottom = torso_top + max(18, int(20 * zoom_level))
+        arm_y = torso_top + max(6, int(8 * zoom_level))
+        leg_bottom_y = torso_bottom + max(16, int(18 * zoom_level))
+        limb_half = max(14, int(18 * zoom_level))
+
+        self.register_item(
+            self.canvas.create_oval(
+                center_x - head_r, head_cy - head_r, center_x + head_r, head_cy + head_r,
+                fill="#dff2f7", outline="black", width=max(1, int(2 * zoom_level))
+            ),
+            outline=True,
+        )
+        for coords in [
+            (center_x, torso_top, center_x, torso_bottom),
+            (center_x - limb_half, arm_y, center_x + limb_half, arm_y),
+            (center_x, torso_bottom, center_x - limb_half + 4, leg_bottom_y),
+            (center_x, torso_bottom, center_x + limb_half - 4, leg_bottom_y),
+        ]:
+            self.register_item(
+                self.canvas.create_line(*coords, fill="black", width=max(1, int(2 * zoom_level))),
+                fill_outline=True,
+            )
+        self.primary_bbox = (center_x - limb_half, y, center_x + limb_half, leg_bottom_y)
+        return center_x, (y + leg_bottom_y) / 2, leg_bottom_y
+
+    def draw_boundary_shape(self, x, y, w, h, zoom_level):
+        center_x = x + w / 2 + max(8, int(8 * zoom_level))
+        radius = max(16, int(20 * zoom_level))
+        center_y = y + radius + max(4, int(4 * zoom_level))
+        line_x = center_x - radius - max(12, int(18 * zoom_level))
+        self.register_item(
+            self.canvas.create_line(
+                line_x, center_y, center_x - radius * 0.45, center_y,
+                fill="black", width=max(1, int(2 * zoom_level))
+            ),
+            fill_outline=True,
+        )
+        self.register_item(
+            self.canvas.create_line(
+                line_x, center_y - radius * 0.9, line_x, center_y + radius * 0.9,
+                fill="black", width=max(1, int(2 * zoom_level))
+            ),
+            fill_outline=True,
+        )
+        self.register_item(
+            self.canvas.create_oval(
+                center_x - radius, center_y - radius, center_x + radius, center_y + radius,
+                fill="#dff2f7", outline="black", width=max(1, int(2 * zoom_level))
+            ),
+            outline=True,
+        )
+        self.primary_bbox = (line_x - 2, center_y - radius, center_x + radius, center_y + radius)
+        return center_x, center_y, center_y + radius
+
+    def draw_control_shape(self, x, y, w, h, zoom_level):
+        center_x = x + w / 2
+        radius = max(16, int(20 * zoom_level))
+        center_y = y + radius + max(4, int(4 * zoom_level))
+        self.register_item(
+            self.canvas.create_oval(
+                center_x - radius, center_y - radius, center_x + radius, center_y + radius,
+                fill="#dff2f7", outline="black", width=max(1, int(2 * zoom_level))
+            ),
+            outline=True,
+        )
+        self.register_item(
+            self.canvas.create_arc(
+                center_x - radius * 0.8, center_y - radius * 0.9,
+                center_x + radius * 0.9, center_y + radius * 0.8,
+                start=40, extent=250, style=tk.ARC, outline="black", width=max(1, int(2 * zoom_level))
+            ),
+            fill_outline=True,
+        )
+        arrow_x = center_x + radius * 0.2
+        arrow_y = center_y - radius * 0.78
+        for coords in [
+            (arrow_x, arrow_y, arrow_x - 8 * zoom_level, arrow_y + 3 * zoom_level),
+            (arrow_x, arrow_y, arrow_x - 3 * zoom_level, arrow_y + 8 * zoom_level),
+        ]:
+            self.register_item(
+                self.canvas.create_line(*coords, fill="black", width=max(1, int(2 * zoom_level))),
+                fill_outline=True,
+            )
+        self.primary_bbox = (center_x - radius, center_y - radius, center_x + radius, center_y + radius)
+        return center_x, center_y, center_y + radius
+
+    def draw_entity_shape(self, x, y, w, h, zoom_level):
+        center_x = x + w / 2
+        radius = max(16, int(20 * zoom_level))
+        center_y = y + radius + max(4, int(4 * zoom_level))
+        self.register_item(
+            self.canvas.create_oval(
+                center_x - radius, center_y - radius, center_x + radius, center_y + radius,
+                fill="#dff2f7", outline="black", width=max(1, int(2 * zoom_level))
+            ),
+            outline=True,
+        )
+        underline_y = center_y + radius + max(4, int(5 * zoom_level))
+        self.register_item(
+            self.canvas.create_line(
+                center_x - radius, underline_y, center_x + radius, underline_y,
+                fill="black", width=max(1, int(2 * zoom_level))
+            ),
+            fill_outline=True,
+        )
+        self.primary_bbox = (center_x - radius, center_y - radius, center_x + radius, underline_y)
+        return center_x, (center_y + underline_y) / 2, underline_y
+
     def create_visual(self):
         zoom_level = 1.0
         if self.tool and hasattr(self.tool, 'zoom_level'):
             zoom_level = self.tool.zoom_level
         
-        if hasattr(self, 'box'):
-            self.canvas.delete(self.box)
-        if hasattr(self, 'text_item'):
-            self.canvas.delete(self.text_item)
-        if hasattr(self, 'lifeline'):
-            self.canvas.delete(self.lifeline)
-        
-        w = self.width * zoom_level
-        h = self.height * zoom_level
-        
-        # Draw actor box
-        self.box = self.canvas.create_rectangle(
-            self.x, self.y, self.x + w, self.y + h,
-            fill="lightblue", outline="black", width=max(1, int(2 * zoom_level))
+        self.delete_visual_items()
+
+        render_type = self.get_render_type()
+        w, h = self.get_visual_metrics(zoom_level)
+        label_margin = max(10, int(12 * zoom_level))
+        x = self.x
+        y = self.y
+        center_x = x + w / 2
+        shape_center_y = y + h / 2
+        shape_bottom_y = y + h
+
+        if self.supports_svg_icon():
+            center_x, shape_center_y, shape_bottom_y = self.draw_svg_shape(x, y, w, h, zoom_level)
+        elif render_type == "actor":
+            center_x, shape_center_y, shape_bottom_y = self.draw_actor_shape(x, y, w, h, zoom_level)
+        elif render_type == "boundary":
+            center_x, shape_center_y, shape_bottom_y = self.draw_boundary_shape(x, y, w, h, zoom_level)
+        elif render_type == "control":
+            center_x, shape_center_y, shape_bottom_y = self.draw_control_shape(x, y, w, h, zoom_level)
+        elif render_type == "entity":
+            center_x, shape_center_y, shape_bottom_y = self.draw_entity_shape(x, y, w, h, zoom_level)
+        elif render_type == "database":
+            center_x, shape_center_y, shape_bottom_y = self.draw_database_shape(x, y, w, h, zoom_level)
+        elif render_type == "collections":
+            center_x, shape_center_y, shape_bottom_y = self.draw_collections_shape(x, y, w, h, zoom_level)
+        elif render_type == "queue":
+            center_x, shape_center_y, shape_bottom_y = self.draw_queue_shape(x, y, w, h, zoom_level)
+        else:
+            center_x, shape_center_y, shape_bottom_y = self.draw_participant_shape(x, y, w, h, zoom_level)
+
+        font_size = max(8, int(10 * zoom_level))
+        label_y = shape_bottom_y + label_margin
+        self.text_item = self.register_item(
+            self.canvas.create_text(
+                center_x, label_y,
+                text=self.name,
+                font=("Arial", font_size, "bold"),
+                width=get_centered_text_width(w, 0.95, minimum=60),
+                justify="center"
+            )
         )
-        
+
+        text_bbox = self.canvas.bbox(self.text_item)
+        visual_bbox = self.primary_bbox or (x, y, x + w, y + h)
+        if text_bbox:
+            self.primary_bbox = (
+                min(visual_bbox[0], text_bbox[0]),
+                min(visual_bbox[1], text_bbox[1]),
+                max(visual_bbox[2], text_bbox[2]),
+                max(visual_bbox[3], text_bbox[3]),
+            )
+        else:
+            self.primary_bbox = visual_bbox
+
+        self.width = max(w / zoom_level, 80)
+        self.height = max((self.primary_bbox[3] - self.primary_bbox[1]) / zoom_level, 40)
+
         # Draw lifeline (dashed vertical line) - scale length with zoom
         lifeline_length = 200 * zoom_level
-        self.lifeline = self.canvas.create_line(
-            self.x + w/2, self.y + h, self.x + w/2, self.y + h + lifeline_length,
-            fill="gray", width=max(1, int(1 * zoom_level)), dash=(5, 5)
+        self.lifeline = self.register_item(
+            self.canvas.create_line(
+                center_x, self.primary_bbox[3], center_x, self.primary_bbox[3] + lifeline_length,
+                fill="gray", width=max(1, int(1 * zoom_level)), dash=(5, 5)
+            ),
+            fill_outline=True,
         )
-        
-        font_size = max(8, int(10 * zoom_level))
-        self.text_item = self.canvas.create_text(
-            self.x + w/2, self.y + h/2,
-            text=self.name,
-            font=("Arial", font_size, "bold"),
-            width=get_centered_text_width(w, 0.8),
-            justify="center"
-        )
-        
-        # Bind events to all items
-        for item in [self.box, self.text_item, self.lifeline]:
+
+        for item in self.visual_items:
             self.canvas.tag_bind(item, "<Button-1>", self.on_press)
             self.canvas.tag_bind(item, "<B1-Motion>", self.on_drag)
             self.canvas.tag_bind(item, "<ButtonRelease-1>", self.on_release)
@@ -1836,9 +2449,15 @@ class SequenceActor:
         self.x += dx
         self.drag_data["x"] = event.x
         self.drag_data["y"] = event.y
-        self.canvas.move(self.box, dx, dy)
-        self.canvas.move(self.text_item, dx, dy)
-        self.canvas.move(self.lifeline, dx, dy)
+        for item in self.visual_items:
+            self.canvas.move(item, dx, dy)
+        if self.primary_bbox:
+            self.primary_bbox = (
+                self.primary_bbox[0] + dx,
+                self.primary_bbox[1] + dy,
+                self.primary_bbox[2] + dx,
+                self.primary_bbox[3] + dy,
+            )
         if self.tool:
             self.tool.update_relationships()
     
@@ -1863,23 +2482,37 @@ class SequenceActor:
         zoom_level = 1.0
         if self.tool and hasattr(self.tool, 'zoom_level'):
             zoom_level = self.tool.zoom_level
-        self.canvas.itemconfig(self.box, outline="red", width=max(2, int(3 * zoom_level)))
+        if getattr(self, "selection_outline_item", None):
+            self.canvas.itemconfig(self.selection_outline_item, outline="red", width=max(2, int(3 * zoom_level)))
+            self.canvas.tag_raise(self.selection_outline_item)
+        for item in getattr(self, "outline_items", []):
+            self.canvas.itemconfig(item, outline="red", width=max(2, int(3 * zoom_level)))
+        for item in getattr(self, "fill_outline_items", []):
+            self.canvas.itemconfig(item, fill="red", width=max(2, int(3 * zoom_level)))
     
     def deselect(self):
         self.selected = False
         zoom_level = 1.0
         if self.tool and hasattr(self.tool, 'zoom_level'):
             zoom_level = self.tool.zoom_level
-        self.canvas.itemconfig(self.box, outline="black", width=max(1, int(2 * zoom_level)))
+        if getattr(self, "selection_outline_item", None):
+            self.canvas.itemconfig(self.selection_outline_item, outline="", width=max(2, int(3 * zoom_level)))
+        for item in getattr(self, "outline_items", []):
+            self.canvas.itemconfig(item, outline="black", width=max(1, int(2 * zoom_level)))
+        for item in getattr(self, "fill_outline_items", []):
+            self.canvas.itemconfig(item, fill="black", width=max(1, int(2 * zoom_level)))
 
     def get_center(self):
+        if self.primary_bbox:
+            return (
+                (self.primary_bbox[0] + self.primary_bbox[2]) / 2,
+                (self.primary_bbox[1] + self.primary_bbox[3]) / 2,
+            )
         zoom_level = self.tool.zoom_level if self.tool and hasattr(self.tool, 'zoom_level') else 1.0
         return (self.x + (self.width * zoom_level) / 2, self.y + (self.height * zoom_level) / 2)
 
     def delete(self):
-        self.canvas.delete(self.box)
-        self.canvas.delete(self.text_item)
-        self.canvas.delete(self.lifeline)
+        self.delete_visual_items()
 
 class StateNode:
     """Represents a state in a state diagram"""
@@ -2002,6 +2635,8 @@ class EREntity:
         self.x = x
         self.y = y
         self.name = name
+        self.entity_id = name.replace(" ", "_").upper()
+        self.entity_alias = None
         self.attributes = []
         self.width = 120
         self.height = 80
@@ -2224,7 +2859,10 @@ class SequenceMessage:
         self.msg_type = msg_type
         self.label = label or "message"
         self.index = index
+        self.arrow_symbol = None
+        self.directives_before = []
         self.selected = False
+        self.visual_items = []
         self.line = None
         self.label_text = None
         self.create_visual()
@@ -2234,6 +2872,214 @@ class SequenceMessage:
         top = max(self.from_actor.y + self.from_actor.height * zoom_level, self.to_actor.y + self.to_actor.height * zoom_level)
         return top + ((self.index + 1) * 50 * zoom_level)
 
+    def get_effective_symbol(self):
+        if self.arrow_symbol:
+            return self.arrow_symbol
+        arrow_map = {
+            "sync": "->>",
+            "async": "-->",
+            "return": "-->>",
+            "note": "--",
+        }
+        return arrow_map.get(self.msg_type, "->>")
+
+    def get_arrow_style(self):
+        symbol = self.get_effective_symbol()
+        central_start = symbol.startswith("()")
+        central_end = symbol.endswith("()")
+        core_symbol = symbol
+        if central_start:
+            core_symbol = core_symbol[2:]
+        if central_end:
+            core_symbol = core_symbol[:-2]
+
+        marker_map = {
+            "->>": (None, "filled"),
+            "-->>": (None, "filled"),
+            "<<->>": ("filled", "filled"),
+            "<<-->>": ("filled", "filled"),
+            "->": (None, None),
+            "-->": (None, None),
+            "-)": (None, "open"),
+            "--)": (None, "open"),
+            "-x": (None, "cross"),
+            "--x": (None, "cross"),
+            "-|\\": (None, "half-top-filled"),
+            "--|\\": (None, "half-top-filled"),
+            "-|/": (None, "half-bottom-filled"),
+            "--|/": (None, "half-bottom-filled"),
+            "-\\\\": (None, "half-top-stick"),
+            "--\\\\": (None, "half-top-stick"),
+            "-//": (None, "half-bottom-stick"),
+            "--//": (None, "half-bottom-stick"),
+            "/|-": ("half-top-filled", None),
+            "/|--": ("half-top-filled", None),
+            "\\|-": ("half-bottom-filled", None),
+            "\\|--": ("half-bottom-filled", None),
+            "//-": ("half-top-stick", None),
+            "//--": ("half-top-stick", None),
+            "\\\\-": ("half-bottom-stick", None),
+            "\\\\--": ("half-bottom-stick", None),
+        }
+        start_marker, end_marker = marker_map.get(core_symbol, (None, None))
+        return {
+            "symbol": symbol,
+            "core_symbol": core_symbol,
+            "central_start": central_start,
+            "central_end": central_end,
+            "dotted": "--" in core_symbol,
+            "start_marker": start_marker,
+            "end_marker": end_marker,
+        }
+
+    def register_item(self, item):
+        self.visual_items.append(item)
+        return item
+
+    def bind_item(self, item):
+        self.canvas.tag_bind(item, "<Button-1>", self.on_click)
+        self.canvas.tag_bind(item, "<Double-Button-1>", self.on_double_click)
+
+    def lower_item(self, item):
+        self.canvas.tag_lower(item)
+        if self.tool and self.canvas.find_withtag("grid"):
+            self.canvas.tag_raise(item, "grid")
+
+    def get_marker_extent(self, marker_kind, zoom_level):
+        if marker_kind == "filled":
+            return max(10, int(10 * zoom_level))
+        if marker_kind in {"open", "cross"}:
+            return max(9, int(9 * zoom_level))
+        return max(8, int(8 * zoom_level))
+
+    def draw_central_circle(self, center_x, y, radius, color, width):
+        return self.register_item(
+            self.canvas.create_oval(
+                center_x - radius,
+                y - radius,
+                center_x + radius,
+                y + radius,
+                outline=color,
+                width=width,
+            )
+        )
+
+    def draw_marker(self, marker_kind, tip_x, y, tip_direction, color, width, zoom_level):
+        size = self.get_marker_extent(marker_kind, zoom_level)
+        half = max(4, int(4 * zoom_level))
+
+        if marker_kind == "filled":
+            points = [
+                tip_x,
+                y,
+                tip_x - (tip_direction * size),
+                y - half,
+                tip_x - (tip_direction * size),
+                y + half,
+            ]
+            return [self.register_item(self.canvas.create_polygon(points, fill=color, outline=color, width=1))]
+
+        if marker_kind == "open":
+            return [
+                self.register_item(
+                    self.canvas.create_line(
+                        tip_x - (tip_direction * size),
+                        y - half,
+                        tip_x,
+                        y,
+                        fill=color,
+                        width=width,
+                    )
+                ),
+                self.register_item(
+                    self.canvas.create_line(
+                        tip_x - (tip_direction * size),
+                        y + half,
+                        tip_x,
+                        y,
+                        fill=color,
+                        width=width,
+                    )
+                ),
+            ]
+
+        if marker_kind == "cross":
+            center_x = tip_x - (tip_direction * max(4, int(4 * zoom_level)))
+            return [
+                self.register_item(
+                    self.canvas.create_line(
+                        center_x - max(3, int(3 * zoom_level)),
+                        y - half,
+                        center_x + max(3, int(3 * zoom_level)),
+                        y + half,
+                        fill=color,
+                        width=width,
+                    )
+                ),
+                self.register_item(
+                    self.canvas.create_line(
+                        center_x - max(3, int(3 * zoom_level)),
+                        y + half,
+                        center_x + max(3, int(3 * zoom_level)),
+                        y - half,
+                        fill=color,
+                        width=width,
+                    )
+                ),
+            ]
+
+        if marker_kind == "half-top-filled":
+            points = [
+                tip_x,
+                y,
+                tip_x - (tip_direction * size),
+                y,
+                tip_x - (tip_direction * size),
+                y - half,
+            ]
+            return [self.register_item(self.canvas.create_polygon(points, fill=color, outline=color, width=1))]
+
+        if marker_kind == "half-bottom-filled":
+            points = [
+                tip_x,
+                y,
+                tip_x - (tip_direction * size),
+                y,
+                tip_x - (tip_direction * size),
+                y + half,
+            ]
+            return [self.register_item(self.canvas.create_polygon(points, fill=color, outline=color, width=1))]
+
+        if marker_kind == "half-top-stick":
+            return [
+                self.register_item(
+                    self.canvas.create_line(
+                        tip_x - (tip_direction * size),
+                        y - half,
+                        tip_x,
+                        y,
+                        fill=color,
+                        width=width,
+                    )
+                )
+            ]
+
+        if marker_kind == "half-bottom-stick":
+            return [
+                self.register_item(
+                    self.canvas.create_line(
+                        tip_x - (tip_direction * size),
+                        y + half,
+                        tip_x,
+                        y,
+                        fill=color,
+                        width=width,
+                    )
+                )
+            ]
+
+        return []
+
     def create_visual(self):
         zoom_level = self.tool.zoom_level if self.tool and hasattr(self.tool, 'zoom_level') else 1.0
         from_x = self.from_actor.get_center()[0]
@@ -2241,32 +3087,120 @@ class SequenceMessage:
         y = self.get_y()
         color = "red" if self.selected else "#2d3436"
         width = max(1, int((3 if self.selected else 2) * zoom_level))
-        dash = None
-        arrow = tk.LAST
+        self.delete()
 
-        if self.msg_type == "return":
-            dash = (6, 4)
-        elif self.msg_type == "note":
-            dash = (2, 4)
-            arrow = None
-        elif self.msg_type == "async":
-            arrow = tk.LAST
+        if self.msg_type == "note":
+            self.line = self.register_item(
+                self.canvas.create_line(from_x, y, to_x, y, fill=color, width=width, dash=(2, 4))
+            )
+            self.lower_item(self.line)
+            self.bind_item(self.line)
+        elif from_x == to_x:
+            loop_width = max(40, int(50 * zoom_level))
+            loop_drop = max(18, int(22 * zoom_level))
+            style = self.get_arrow_style()
+            dash = (6, 4) if style["dotted"] else None
+            points = [
+                from_x,
+                y,
+                from_x + loop_width,
+                y,
+                from_x + loop_width,
+                y + loop_drop,
+                from_x,
+                y + loop_drop,
+            ]
+            self.line = self.register_item(
+                self.canvas.create_line(*points, fill=color, width=width, dash=dash, smooth=False)
+            )
+            self.lower_item(self.line)
+            self.bind_item(self.line)
+            for item in self.draw_marker(
+                style["end_marker"] or "filled",
+                from_x,
+                y + loop_drop,
+                -1,
+                color,
+                width,
+                zoom_level,
+            ):
+                self.lower_item(item)
+                self.bind_item(item)
+        else:
+            style = self.get_arrow_style()
+            dash = (6, 4) if style["dotted"] else None
+            direction = 1 if to_x >= from_x else -1
+            circle_radius = max(4, int(5 * zoom_level))
 
-        self.line = self.canvas.create_line(from_x, y, to_x, y, fill=color, width=width, dash=dash, arrow=arrow)
-        self.canvas.tag_lower(self.line)
-        if self.tool and self.canvas.find_withtag("grid"):
-            self.canvas.tag_raise(self.line, "grid")
-        self.canvas.tag_bind(self.line, "<Button-1>", self.on_click)
-        self.canvas.tag_bind(self.line, "<Double-Button-1>", self.on_double_click)
+            source_anchor = from_x + (direction * (circle_radius + 2) if style["central_start"] else 0)
+            target_anchor = to_x - (direction * (circle_radius + 2) if style["central_end"] else 0)
+            start_extent = self.get_marker_extent(style["start_marker"], zoom_level) if style["start_marker"] else 0
+            end_extent = self.get_marker_extent(style["end_marker"], zoom_level) if style["end_marker"] else 0
+
+            line_start_x = source_anchor + (direction * start_extent)
+            line_end_x = target_anchor - (direction * end_extent)
+            if direction > 0 and line_start_x > line_end_x:
+                line_start_x = source_anchor
+                line_end_x = target_anchor
+            if direction < 0 and line_start_x < line_end_x:
+                line_start_x = source_anchor
+                line_end_x = target_anchor
+
+            self.line = self.register_item(
+                self.canvas.create_line(line_start_x, y, line_end_x, y, fill=color, width=width, dash=dash)
+            )
+            self.lower_item(self.line)
+            self.bind_item(self.line)
+
+            if style["central_start"]:
+                circle = self.draw_central_circle(from_x, y, circle_radius, color, width)
+                self.lower_item(circle)
+                self.bind_item(circle)
+            if style["central_end"]:
+                circle = self.draw_central_circle(to_x, y, circle_radius, color, width)
+                self.lower_item(circle)
+                self.bind_item(circle)
+
+            if style["start_marker"]:
+                for item in self.draw_marker(
+                    style["start_marker"],
+                    source_anchor,
+                    y,
+                    -direction,
+                    color,
+                    width,
+                    zoom_level,
+                ):
+                    self.lower_item(item)
+                    self.bind_item(item)
+            if style["end_marker"]:
+                for item in self.draw_marker(
+                    style["end_marker"],
+                    target_anchor,
+                    y,
+                    direction,
+                    color,
+                    width,
+                    zoom_level,
+                ):
+                    self.lower_item(item)
+                    self.bind_item(item)
 
         label_fill = "#6c5ce7" if self.msg_type != "note" else "#b9770e"
-        self.label_text = self.canvas.create_text(
-            (from_x + to_x) / 2, y - (12 * zoom_level), text=self.label,
-            font=("Arial", max(8, int(9 * zoom_level))), fill=label_fill
+        label_x = (from_x + to_x) / 2
+        if from_x == to_x:
+            label_x = from_x + max(18, int(22 * zoom_level))
+        self.label_text = self.register_item(
+            self.canvas.create_text(
+                label_x,
+                y - (12 * zoom_level),
+                text=self.label,
+                font=("Arial", max(8, int(9 * zoom_level))),
+                fill=label_fill,
+            )
         )
-        self.canvas.tag_lower(self.label_text)
-        self.canvas.tag_bind(self.label_text, "<Button-1>", self.on_click)
-        self.canvas.tag_bind(self.label_text, "<Double-Button-1>", self.on_double_click)
+        self.lower_item(self.label_text)
+        self.bind_item(self.label_text)
 
     def update_position(self):
         self.delete()
@@ -2298,10 +3232,9 @@ class SequenceMessage:
         self.update_position()
 
     def delete(self):
-        if self.line:
-            self.canvas.delete(self.line)
-        if self.label_text:
-            self.canvas.delete(self.label_text)
+        for item in self.visual_items:
+            self.canvas.delete(item)
+        self.visual_items = []
         self.line = None
         self.label_text = None
 
@@ -2418,6 +3351,10 @@ class ERRelationship:
         self.to_entity = to_entity
         self.rel_type = rel_type
         self.label = label
+        self.raw_relation = None
+        self.from_cardinality = None
+        self.to_cardinality = None
+        self.identifying = True
         self.selected = False
         self.line = None
         self.label_text = None
@@ -2426,6 +3363,8 @@ class ERRelationship:
         self.create_visual()
 
     def cardinalities(self):
+        if self.from_cardinality and self.to_cardinality:
+            return self.from_cardinality, self.to_cardinality
         if self.rel_type == "one-to-one":
             return "1", "1"
         if self.rel_type == "many-to-many":
@@ -2449,10 +3388,11 @@ class ERRelationship:
         from_point, to_point = get_box_connection_points(from_rect, to_rect)
         color = "red" if self.selected else "#8e5a2b"
         width = max(1, int((3 if self.selected else 2) * zoom_level))
+        dash = None if self.identifying else (6, 4)
 
         self.line = self.canvas.create_line(
             from_point[0], from_point[1], to_point[0], to_point[1],
-            fill=color, width=width
+            fill=color, width=width, dash=dash
         )
         self.canvas.tag_lower(self.line)
         if self.tool and self.canvas.find_withtag("grid"):
@@ -2557,10 +3497,12 @@ class MermaidDiagramTool:
         self.flowchart_connections = []
         self.sequence_actors = []  # For sequence diagram
         self.sequence_messages = []  # For sequence diagram
+        self.sequence_directives = []
         self.state_nodes = []  # For state diagram
         self.state_transitions = []  # For state diagram
         self.er_entities = []  # For ER diagram
         self.er_relationships = []  # For ER diagram
+        self.er_direction = None
         self.relationships = []
         self.selected_class = None
         self.selected_node = None  # For flowchart mode
@@ -2572,6 +3514,7 @@ class MermaidDiagramTool:
         self.pan_start_x = 0  # Track panning start position
         self.pan_start_y = 0
         self.is_panning = False  # Track if currently panning
+        self.canvas_svg_exports = {}
         
         # Track changes and current file
         self.has_unsaved_changes = False
@@ -2601,6 +3544,9 @@ class MermaidDiagramTool:
         file_menu.add_command(label="New", command=self.new_diagram)
         file_menu.add_command(label="Open Mermaid", command=self.open_mermaid)
         file_menu.add_command(label="Save Mermaid", command=self.save_mermaid)
+        file_menu.add_separator()
+        file_menu.add_command(label="Export PNG", command=self.export_png)
+        file_menu.add_command(label="Export SVG", command=self.export_svg)
         
         app_shell = tk.Frame(self.root, bg="#f3f6fb")
         app_shell.pack(fill=tk.BOTH, expand=True, padx=14, pady=14)
@@ -2694,6 +3640,10 @@ class MermaidDiagramTool:
         self.open_button.pack(side=tk.LEFT, padx=3, pady=2)
         self.save_button = tk.Button(file_tools, text="Save", command=self.save_mermaid, width=7)
         self.save_button.pack(side=tk.LEFT, padx=3, pady=2)
+        self.export_png_button = tk.Button(file_tools, text="PNG", command=self.export_png, width=7)
+        self.export_png_button.pack(side=tk.LEFT, padx=3, pady=2)
+        self.export_svg_button = tk.Button(file_tools, text="SVG", command=self.export_svg, width=7)
+        self.export_svg_button.pack(side=tk.LEFT, padx=3, pady=2)
 
         self.add_button = tk.Button(mode_tools, text="Add Class", command=self.add_primary_element, width=11)
         self.add_button.pack(side=tk.LEFT, padx=3, pady=2)
@@ -4604,29 +5554,8 @@ class MermaidDiagramTool:
             
     def update_scroll_region(self):
         """Update canvas scroll region to include all elements with padding"""
-        # Get bounding box of all items on canvas, excluding grid
-        # Delete grid temporarily to get accurate bbox
-        grid_items_coords = []
-        grid_items = list(self.canvas.find_withtag("grid"))
-        
-        # Store grid line coordinates and delete them
-        for item in grid_items:
-            try:
-                coords = self.canvas.coords(item)
-                fill = self.canvas.itemcget(item, "fill")
-                grid_items_coords.append((coords, fill))
-                self.canvas.delete(item)
-            except:
-                pass
-        
-        bbox = self.canvas.bbox("all")
-        
-        # Recreate grid lines
-        for coords, fill in grid_items_coords:
-            if len(coords) == 4:
-                self.canvas.create_line(coords[0], coords[1], coords[2], coords[3], 
-                                       fill=fill, tags="grid", state="normal")
-        
+        bbox = self.get_content_bbox()
+
         if bbox:
             # Add padding around the content
             padding = 100
@@ -4640,47 +5569,57 @@ class MermaidDiagramTool:
             self.canvas.configure(scrollregion=scroll_region)
         else:
             # Default scroll region if no items
-            self.canvas.configure(scrollregion=(0, 0, 2000, 2000))
-        
-        # Only redraw grid if scroll region significantly changed
-        # (Don't redraw during dragging to avoid visual glitches)
+            scroll_region = (0, 0, 2000, 2000)
+
+        self.canvas.configure(scrollregion=scroll_region)
+
         if hasattr(self, 'show_grid') and self.show_grid.get():
-            # Check if we need to expand the grid
-            if hasattr(self, '_last_grid_region'):
-                old_x1, old_y1, old_x2, old_y2 = self._last_grid_region
-                if bbox:
-                    new_x1, new_y1, new_x2, new_y2 = bbox
-                    # Only redraw if the new region is significantly larger
-                    if (new_x1 < old_x1 - 200 or new_y1 < old_y1 - 200 or 
-                        new_x2 > old_x2 + 200 or new_y2 > old_y2 + 200):
-                        self.draw_grid()
-                        self._last_grid_region = bbox
-                        self.canvas.after_idle(self.ensure_grid_behind)
-            else:
-                # First time, draw the grid
+            if self.should_redraw_grid(scroll_region):
                 self.draw_grid()
-                if bbox:
-                    self._last_grid_region = bbox
-                self.canvas.after_idle(self.ensure_grid_behind)
-        
-        # Ensure grid stays behind after scroll region update
-        if grid_items_coords:
+                self._last_grid_scroll_region = scroll_region
             self.canvas.after_idle(self.ensure_grid_behind)
+
+    def get_content_bbox(self):
+        """Return the bbox of all non-grid canvas items."""
+        items = self.canvas.find_all()
+        non_grid_items = [item for item in items if "grid" not in self.canvas.gettags(item)]
+        if not non_grid_items:
+            return None
+
+        boxes = [self.canvas.bbox(item) for item in non_grid_items]
+        boxes = [box for box in boxes if box]
+        if not boxes:
+            return None
+
+        x1 = min(box[0] for box in boxes)
+        y1 = min(box[1] for box in boxes)
+        x2 = max(box[2] for box in boxes)
+        y2 = max(box[3] for box in boxes)
+        return (x1, y1, x2, y2)
+
+    def should_redraw_grid(self, scroll_region, tolerance=120):
+        """Redraw the grid only when the scrollable area changes meaningfully."""
+        previous_region = getattr(self, "_last_grid_scroll_region", None)
+        if previous_region is None:
+            return True
+
+        return any(
+            abs(current - previous) > tolerance
+            for current, previous in zip(scroll_region, previous_region)
+        )
     
     def toggle_grid(self):
         """Toggle grid visibility"""
         if self.show_grid.get():
             self.draw_grid()
-            # Store the current bbox for future comparisons
-            bbox = self.canvas.bbox("all")
-            if bbox:
-                self._last_grid_region = bbox
+            scroll_region = self.canvas.cget("scrollregion").split()
+            if len(scroll_region) == 4:
+                self._last_grid_scroll_region = tuple(map(float, scroll_region))
             self.canvas.after_idle(self.ensure_grid_behind)
         else:
             self.hide_grid()
-            # Clear the stored region
-            if hasattr(self, '_last_grid_region'):
-                delattr(self, '_last_grid_region')
+            if hasattr(self, '_last_grid_scroll_region'):
+                delattr(self, '_last_grid_scroll_region')
     
     def draw_grid(self):
         """Draw grid on canvas (draws once, scrolls automatically)"""
@@ -4726,6 +5665,8 @@ class MermaidDiagramTool:
     def hide_grid(self):
         """Hide grid from canvas"""
         self.canvas.delete("grid")
+        if hasattr(self, '_last_grid_scroll_region'):
+            delattr(self, '_last_grid_scroll_region')
     
     def ensure_grid_behind(self):
         """Ensure grid stays behind all other elements"""
@@ -4763,6 +5704,461 @@ class MermaidDiagramTool:
                 self.update_status(f"Saved to {os.path.basename(filename)}")
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to save file: {str(e)}")
+
+    def get_export_base_name(self):
+        if self.current_file:
+            return os.path.splitext(os.path.basename(self.current_file))[0]
+        return f"{self.diagram_type or 'diagram'}_export"
+
+    def get_export_bounds(self, padding=24):
+        bbox = self.get_content_bbox()
+        if not bbox:
+            return None
+        x1, y1, x2, y2 = bbox
+        return (
+            int(math.floor(x1 - padding)),
+            int(math.floor(y1 - padding)),
+            int(math.ceil(x2 + padding)),
+            int(math.ceil(y2 + padding)),
+        )
+
+    def get_export_items(self):
+        return [item for item in self.canvas.find_all() if "grid" not in self.canvas.gettags(item)]
+
+    def export_png(self):
+        self.export_diagram("png")
+
+    def export_svg(self):
+        self.export_diagram("svg")
+
+    def export_diagram(self, export_format):
+        if export_format not in {"png", "svg"}:
+            messagebox.showerror("Export Error", f"Unsupported export format: {export_format}")
+            return
+
+        export_bounds = self.get_export_bounds()
+        if not export_bounds:
+            messagebox.showinfo("Export", "There is nothing on the canvas to export yet.")
+            return
+
+        default_name = f"{self.get_export_base_name()}.{export_format}"
+        filename = filedialog.asksaveasfilename(
+            defaultextension=f".{export_format}",
+            initialfile=default_name,
+            filetypes=[(f"{export_format.upper()} files", f"*.{export_format}"), ("All files", "*.*")],
+        )
+        if not filename:
+            return
+
+        try:
+            self.canvas.update_idletasks()
+            if export_format == "svg":
+                self.save_canvas_as_svg(filename, export_bounds)
+            else:
+                self.save_canvas_as_png(filename, export_bounds)
+            self.update_status(f"Exported {os.path.basename(filename)}")
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export diagram: {str(e)}")
+
+    def parse_dash_pattern(self, dash_value):
+        text = (dash_value or "").strip()
+        if not text or text in {"{}", "none"}:
+            return None
+        values = [int(float(part)) for part in re.findall(r"-?\d+(?:\.\d+)?", text)]
+        return values or None
+
+    def parse_canvas_font(self, font_value):
+        try:
+            actual = tkfont.Font(font=font_value).actual()
+            return {
+                "family": actual.get("family", "Arial"),
+                "size": abs(int(actual.get("size", 10))),
+                "weight": actual.get("weight", "normal"),
+                "slant": actual.get("slant", "roman"),
+            }
+        except Exception:
+            parts = str(font_value).split()
+            family = parts[0] if parts else "Arial"
+            size = 10
+            for part in parts[1:]:
+                if str(part).lstrip("-").isdigit():
+                    size = abs(int(part))
+                    break
+            return {"family": family, "size": size, "weight": "normal", "slant": "roman"}
+
+    def get_export_font(self, font_value):
+        if ImageFont is None:
+            return None
+        font_info = self.parse_canvas_font(font_value)
+        size = max(8, int(font_info["size"]))
+        candidates = []
+        family = font_info["family"].lower().replace(" ", "")
+        if "consolas" in family:
+            candidates.extend(["consola.ttf", "cour.ttf"])
+        elif "segoeui" in family:
+            candidates.extend(["segoeui.ttf", "arial.ttf"])
+        else:
+            candidates.extend(["arial.ttf", "segoeui.ttf", "DejaVuSans.ttf"])
+        for candidate in candidates:
+            try:
+                return ImageFont.truetype(candidate, size)
+            except OSError:
+                continue
+        return ImageFont.load_default()
+
+    def get_pil_color(self, value, default=None):
+        text = (value or "").strip()
+        if not text:
+            return default
+        if ImageColor is None:
+            return default or text
+        try:
+            return ImageColor.getrgb(text)
+        except ValueError:
+            return default
+
+    def svg_escape(self, value):
+        return html.escape("" if value is None else str(value), quote=True)
+
+    def svg_dash_attr(self, item):
+        dash = self.parse_dash_pattern(self.canvas.itemcget(item, "dash"))
+        if not dash:
+            return ""
+        return f' stroke-dasharray="{" ".join(str(part) for part in dash)}"'
+
+    def svg_arrow_marker_attrs(self, item):
+        arrow = self.canvas.itemcget(item, "arrow")
+        if arrow == tk.FIRST:
+            return ' marker-start="url(#arrowhead)"'
+        if arrow == tk.LAST:
+            return ' marker-end="url(#arrowhead)"'
+        if arrow == tk.BOTH:
+            return ' marker-start="url(#arrowhead)" marker-end="url(#arrowhead)"'
+        return ""
+
+    def canvas_arc_path(self, coords, start_degrees, extent_degrees, style):
+        x1, y1, x2, y2 = coords
+        rx = abs(x2 - x1) / 2
+        ry = abs(y2 - y1) / 2
+        if rx == 0 or ry == 0:
+            return ""
+        cx = min(x1, x2) + rx
+        cy = min(y1, y2) + ry
+
+        start_rad = math.radians(start_degrees)
+        end_rad = math.radians(start_degrees + extent_degrees)
+
+        start_x = cx + (rx * math.cos(start_rad))
+        start_y = cy - (ry * math.sin(start_rad))
+        end_x = cx + (rx * math.cos(end_rad))
+        end_y = cy - (ry * math.sin(end_rad))
+        large_arc = 1 if abs(extent_degrees) > 180 else 0
+        sweep = 0 if extent_degrees >= 0 else 1
+
+        path = f"M {start_x:.2f} {start_y:.2f} A {rx:.2f} {ry:.2f} 0 {large_arc} {sweep} {end_x:.2f} {end_y:.2f}"
+        if style == tk.CHORD:
+            path += " Z"
+        elif style == tk.PIESLICE:
+            path = f"M {cx:.2f} {cy:.2f} L {start_x:.2f} {start_y:.2f} " + path[1:] + " Z"
+        return path
+
+    def get_svg_export_markup_for_item(self, item, offset_x, offset_y):
+        export_info = self.canvas_svg_exports.get(item)
+        if not export_info:
+            return ""
+        svg_markup = export_info["svg_markup"]
+        x = export_info["x"] + offset_x
+        y = export_info["y"] + offset_y
+        return re.sub(r"<svg\b", f'<svg x="{x:.2f}" y="{y:.2f}"', svg_markup, count=1)
+
+    def build_svg_document(self, export_bounds):
+        x1, y1, x2, y2 = export_bounds
+        width = max(1, x2 - x1)
+        height = max(1, y2 - y1)
+        offset_x = -x1
+        offset_y = -y1
+        elements = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+            "  <defs>",
+            '    <marker id="arrowhead" markerWidth="10" markerHeight="8" refX="8" refY="4" orient="auto-start-reverse">',
+            '      <path d="M 0 0 L 8 4 L 0 8 z" fill="context-stroke" />',
+            "    </marker>",
+            "  </defs>",
+            f'  <rect x="0" y="0" width="{width}" height="{height}" fill="#ffffff" />',
+        ]
+
+        for item in self.get_export_items():
+            item_type = self.canvas.type(item)
+            coords = self.canvas.coords(item)
+
+            if item_type == "line":
+                shifted = [coords[i] + (offset_x if i % 2 == 0 else offset_y) for i in range(len(coords))]
+                stroke = self.canvas.itemcget(item, "fill") or "#000000"
+                stroke_width = float(self.canvas.itemcget(item, "width") or 1)
+                dash_attr = self.svg_dash_attr(item)
+                marker_attr = self.svg_arrow_marker_attrs(item)
+                if len(shifted) == 4:
+                    elements.append(
+                        f'  <line x1="{shifted[0]:.2f}" y1="{shifted[1]:.2f}" x2="{shifted[2]:.2f}" y2="{shifted[3]:.2f}"'
+                        f' stroke="{self.svg_escape(stroke)}" stroke-width="{stroke_width:.2f}" fill="none"{dash_attr}{marker_attr} />'
+                    )
+                else:
+                    points = " ".join(f"{shifted[i]:.2f},{shifted[i+1]:.2f}" for i in range(0, len(shifted), 2))
+                    elements.append(
+                        f'  <polyline points="{points}" stroke="{self.svg_escape(stroke)}" stroke-width="{stroke_width:.2f}" fill="none"{dash_attr}{marker_attr} />'
+                    )
+            elif item_type == "rectangle":
+                x_a, y_a, x_b, y_b = coords
+                fill = self.canvas.itemcget(item, "fill") or "none"
+                stroke = self.canvas.itemcget(item, "outline") or "none"
+                stroke_width = float(self.canvas.itemcget(item, "width") or 1)
+                elements.append(
+                    f'  <rect x="{x_a + offset_x:.2f}" y="{y_a + offset_y:.2f}" width="{abs(x_b - x_a):.2f}" height="{abs(y_b - y_a):.2f}"'
+                    f' fill="{self.svg_escape(fill)}" stroke="{self.svg_escape(stroke)}" stroke-width="{stroke_width:.2f}" />'
+                )
+            elif item_type == "oval":
+                x_a, y_a, x_b, y_b = coords
+                fill = self.canvas.itemcget(item, "fill") or "none"
+                stroke = self.canvas.itemcget(item, "outline") or "none"
+                stroke_width = float(self.canvas.itemcget(item, "width") or 1)
+                cx = (x_a + x_b) / 2 + offset_x
+                cy = (y_a + y_b) / 2 + offset_y
+                rx = abs(x_b - x_a) / 2
+                ry = abs(y_b - y_a) / 2
+                elements.append(
+                    f'  <ellipse cx="{cx:.2f}" cy="{cy:.2f}" rx="{rx:.2f}" ry="{ry:.2f}"'
+                    f' fill="{self.svg_escape(fill)}" stroke="{self.svg_escape(stroke)}" stroke-width="{stroke_width:.2f}" />'
+                )
+            elif item_type == "polygon":
+                fill = self.canvas.itemcget(item, "fill") or "none"
+                stroke = self.canvas.itemcget(item, "outline") or "none"
+                stroke_width = float(self.canvas.itemcget(item, "width") or 1)
+                points = " ".join(
+                    f"{coords[i] + offset_x:.2f},{coords[i+1] + offset_y:.2f}" for i in range(0, len(coords), 2)
+                )
+                elements.append(
+                    f'  <polygon points="{points}" fill="{self.svg_escape(fill)}" stroke="{self.svg_escape(stroke)}" stroke-width="{stroke_width:.2f}" />'
+                )
+            elif item_type == "arc":
+                stroke = self.canvas.itemcget(item, "outline") or "#000000"
+                fill = self.canvas.itemcget(item, "fill") or "none"
+                stroke_width = float(self.canvas.itemcget(item, "width") or 1)
+                start = float(self.canvas.itemcget(item, "start") or 0)
+                extent = float(self.canvas.itemcget(item, "extent") or 0)
+                style = self.canvas.itemcget(item, "style") or tk.PIESLICE
+                shifted = [coords[0] + offset_x, coords[1] + offset_y, coords[2] + offset_x, coords[3] + offset_y]
+                path = self.canvas_arc_path(shifted, start, extent, style)
+                if path:
+                    elements.append(
+                        f'  <path d="{path}" fill="{self.svg_escape(fill)}" stroke="{self.svg_escape(stroke)}" stroke-width="{stroke_width:.2f}" />'
+                    )
+            elif item_type == "text":
+                x, y = coords[0] + offset_x, coords[1] + offset_y
+                text = self.canvas.itemcget(item, "text")
+                fill = self.canvas.itemcget(item, "fill") or "#000000"
+                font_info = self.parse_canvas_font(self.canvas.itemcget(item, "font"))
+                anchor = self.canvas.itemcget(item, "anchor") or "center"
+                anchor_map = {
+                    "w": "start",
+                    "sw": "start",
+                    "nw": "start",
+                    "e": "end",
+                    "se": "end",
+                    "ne": "end",
+                }
+                text_anchor = anchor_map.get(anchor, "middle")
+                font_style = ' font-style="italic"' if font_info["slant"] == "italic" else ""
+                font_weight = ' font-weight="bold"' if font_info["weight"] == "bold" else ""
+                lines = text.splitlines() or [""]
+                line_height = max(12, int(font_info["size"] * 1.25))
+                base_y = y - ((len(lines) - 1) * line_height / 2)
+                elements.append(
+                    f'  <text x="{x:.2f}" y="{base_y:.2f}" fill="{self.svg_escape(fill)}" text-anchor="{text_anchor}"'
+                    f' font-family="{self.svg_escape(font_info["family"])}" font-size="{font_info["size"]}"{font_weight}{font_style}>'
+                )
+                for index, line in enumerate(lines):
+                    dy = 0 if index == 0 else line_height
+                    elements.append(f'    <tspan x="{x:.2f}" dy="{dy}">{self.svg_escape(line)}</tspan>')
+                elements.append("  </text>")
+            elif item_type == "image":
+                markup = self.get_svg_export_markup_for_item(item, offset_x, offset_y)
+                if markup:
+                    elements.append(f"  {markup}")
+
+        elements.append("</svg>")
+        return "\n".join(elements)
+
+    def save_canvas_as_svg(self, filename, export_bounds):
+        svg_document = self.build_svg_document(export_bounds)
+        with open(filename, "w", encoding="utf-8") as handle:
+            handle.write(svg_document)
+
+    def draw_dashed_line_on_image(self, draw, start, end, dash_pattern, fill, width):
+        if not dash_pattern:
+            draw.line([start, end], fill=fill, width=width)
+            return
+        x1, y1 = start
+        x2, y2 = end
+        length = math.hypot(x2 - x1, y2 - y1)
+        if length == 0:
+            return
+        dx = (x2 - x1) / length
+        dy = (y2 - y1) / length
+        pattern = dash_pattern if len(dash_pattern) > 1 else [dash_pattern[0], dash_pattern[0]]
+        distance = 0.0
+        draw_segment = True
+        pattern_index = 0
+        while distance < length:
+            seg_length = pattern[pattern_index % len(pattern)]
+            next_distance = min(length, distance + seg_length)
+            if draw_segment:
+                draw.line(
+                    [
+                        (x1 + dx * distance, y1 + dy * distance),
+                        (x1 + dx * next_distance, y1 + dy * next_distance),
+                    ],
+                    fill=fill,
+                    width=width,
+                )
+            draw_segment = not draw_segment
+            pattern_index += 1
+            distance = next_distance
+
+    def draw_arrowhead_on_image(self, draw, tip, tail, fill, width):
+        dx = tip[0] - tail[0]
+        dy = tip[1] - tail[1]
+        length = math.hypot(dx, dy)
+        if length == 0:
+            return
+        ux = dx / length
+        uy = dy / length
+        size = max(8, int(width * 3))
+        px = -uy
+        py = ux
+        base_x = tip[0] - ux * size
+        base_y = tip[1] - uy * size
+        points = [
+            tip,
+            (base_x + px * (size * 0.45), base_y + py * (size * 0.45)),
+            (base_x - px * (size * 0.45), base_y - py * (size * 0.45)),
+        ]
+        draw.polygon(points, fill=fill)
+
+    def render_canvas_to_png_image(self, export_bounds):
+        if Image is None or ImageDraw is None:
+            raise RuntimeError("Pillow is required for PNG export.")
+
+        x1, y1, x2, y2 = export_bounds
+        width = max(1, x2 - x1)
+        height = max(1, y2 - y1)
+        offset_x = -x1
+        offset_y = -y1
+
+        image = Image.new("RGBA", (width, height), (255, 255, 255, 255))
+        draw = ImageDraw.Draw(image)
+
+        for item in self.get_export_items():
+            item_type = self.canvas.type(item)
+            coords = self.canvas.coords(item)
+
+            if item_type == "line":
+                shifted = [(coords[i] + offset_x, coords[i + 1] + offset_y) for i in range(0, len(coords), 2)]
+                fill = self.get_pil_color(self.canvas.itemcget(item, "fill"), (0, 0, 0))
+                width_value = max(1, int(float(self.canvas.itemcget(item, "width") or 1)))
+                dash = self.parse_dash_pattern(self.canvas.itemcget(item, "dash"))
+                for start, end in zip(shifted, shifted[1:]):
+                    self.draw_dashed_line_on_image(draw, start, end, dash, fill, width_value)
+                arrow = self.canvas.itemcget(item, "arrow")
+                if arrow in {tk.FIRST, tk.BOTH} and len(shifted) >= 2:
+                    self.draw_arrowhead_on_image(draw, shifted[0], shifted[1], fill, width_value)
+                if arrow in {tk.LAST, tk.BOTH} and len(shifted) >= 2:
+                    self.draw_arrowhead_on_image(draw, shifted[-1], shifted[-2], fill, width_value)
+            elif item_type == "rectangle":
+                x_a, y_a, x_b, y_b = coords
+                fill = self.get_pil_color(self.canvas.itemcget(item, "fill"))
+                outline = self.get_pil_color(self.canvas.itemcget(item, "outline"), (0, 0, 0))
+                width_value = max(1, int(float(self.canvas.itemcget(item, "width") or 1)))
+                draw.rectangle(
+                    [x_a + offset_x, y_a + offset_y, x_b + offset_x, y_b + offset_y],
+                    fill=fill,
+                    outline=outline,
+                    width=width_value,
+                )
+            elif item_type == "oval":
+                x_a, y_a, x_b, y_b = coords
+                fill = self.get_pil_color(self.canvas.itemcget(item, "fill"))
+                outline = self.get_pil_color(self.canvas.itemcget(item, "outline"), (0, 0, 0))
+                width_value = max(1, int(float(self.canvas.itemcget(item, "width") or 1)))
+                draw.ellipse(
+                    [x_a + offset_x, y_a + offset_y, x_b + offset_x, y_b + offset_y],
+                    fill=fill,
+                    outline=outline,
+                    width=width_value,
+                )
+            elif item_type == "polygon":
+                points = [(coords[i] + offset_x, coords[i + 1] + offset_y) for i in range(0, len(coords), 2)]
+                fill = self.get_pil_color(self.canvas.itemcget(item, "fill"))
+                outline = self.get_pil_color(self.canvas.itemcget(item, "outline"), (0, 0, 0))
+                draw.polygon(points, fill=fill, outline=outline)
+            elif item_type == "arc":
+                x_a, y_a, x_b, y_b = coords
+                fill = self.get_pil_color(self.canvas.itemcget(item, "fill"))
+                outline = self.get_pil_color(self.canvas.itemcget(item, "outline"), (0, 0, 0))
+                width_value = max(1, int(float(self.canvas.itemcget(item, "width") or 1)))
+                start = float(self.canvas.itemcget(item, "start") or 0)
+                end = start + float(self.canvas.itemcget(item, "extent") or 0)
+                style = self.canvas.itemcget(item, "style") or tk.PIESLICE
+                box = [x_a + offset_x, y_a + offset_y, x_b + offset_x, y_b + offset_y]
+                if style == tk.ARC:
+                    draw.arc(box, start=start, end=end, fill=outline, width=width_value)
+                elif style == tk.CHORD:
+                    draw.chord(box, start=start, end=end, fill=fill, outline=outline, width=width_value)
+                else:
+                    draw.pieslice(box, start=start, end=end, fill=fill, outline=outline, width=width_value)
+            elif item_type == "text":
+                x, y = coords[0] + offset_x, coords[1] + offset_y
+                text = self.canvas.itemcget(item, "text")
+                fill = self.get_pil_color(self.canvas.itemcget(item, "fill"), (0, 0, 0))
+                font = self.get_export_font(self.canvas.itemcget(item, "font"))
+                anchor = self.canvas.itemcget(item, "anchor") or "center"
+                anchor_map = {
+                    "center": "mm",
+                    "n": "ma",
+                    "s": "md",
+                    "e": "rm",
+                    "w": "lm",
+                    "ne": "ra",
+                    "nw": "la",
+                    "se": "rd",
+                    "sw": "ld",
+                }
+                try:
+                    draw.multiline_text((x, y), text, fill=fill, font=font, align="center", anchor=anchor_map.get(anchor, "mm"))
+                except TypeError:
+                    draw.multiline_text((x, y), text, fill=fill, font=font, align="center")
+            elif item_type == "image":
+                export_info = self.canvas_svg_exports.get(item)
+                if not export_info:
+                    continue
+                temp_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:
+                        temp_path = handle.name
+                    export_info["photo"].write(temp_path, format="png")
+                    image_overlay = Image.open(temp_path).convert("RGBA")
+                    x = int(round(export_info["x"] + offset_x))
+                    y = int(round(export_info["y"] + offset_y))
+                    image.alpha_composite(image_overlay, (x, y))
+                finally:
+                    if temp_path and os.path.exists(temp_path):
+                        os.remove(temp_path)
+
+        return image.convert("RGB")
+
+    def save_canvas_as_png(self, filename, export_bounds):
+        image = self.render_canvas_to_png_image(export_bounds)
+        image.save(filename, format="PNG")
             
     def open_mermaid(self):
         """Open and load a Mermaid diagram"""
@@ -4826,10 +6222,13 @@ class MermaidDiagramTool:
         self.flowchart_connections.clear()
         self.sequence_actors.clear()
         self.sequence_messages.clear()
+        self.sequence_directives.clear()
         self.state_nodes.clear()
         self.state_transitions.clear()
         self.er_entities.clear()
         self.er_relationships.clear()
+        self.er_direction = None
+        self.canvas_svg_exports.clear()
         self.relationships.clear()
         self.selected_class = None
         self.selected_node = None
@@ -4962,43 +6361,94 @@ class MermaidDiagramTool:
         lines = [line.strip() for line in mermaid_code.split('\n') if line.strip()]
         actor_lookup = {}
         message_rows = []
+        pending_directives = []
 
         for line in lines:
             if line.startswith("sequenceDiagram"):
                 continue
-            participant_match = re.match(r'(participant|actor)\s+([A-Za-z0-9_]+)(?:\s+as\s+(.+))?', line)
+            participant_match = re.match(r'(participant|actor)\s+([A-Za-z0-9_]+)(@\{.*?\})?(?:\s+as\s+(.+))?$', line)
             if participant_match:
-                _, actor_id, display_name = participant_match.groups()
-                actor_lookup[actor_id] = {"name": (display_name or actor_id).strip()}
+                actor_kind, actor_id, config_text, display_name = participant_match.groups()
+                config = parse_sequence_participant_config(config_text)
+                actor_lookup[actor_id] = {
+                    "name": (display_name or config.get("alias") or actor_id).strip(),
+                    "kind": actor_kind,
+                    "participant_type": config.get("type"),
+                }
                 continue
 
-            msg_match = re.match(r'([A-Za-z0-9_]+)\s*(-{1,2}>>|\-{1,2}>|-->>)\s*([A-Za-z0-9_]+)\s*:\s*(.+)', line)
+            directive_match = re.match(r'(create\s+(?:participant|actor)\s+[A-Za-z0-9_]+(?:\s+as\s+.+)?|destroy\s+[A-Za-z0-9_]+)$', line)
+            if directive_match:
+                directive_text = directive_match.group(1)
+                pending_directives.append(directive_text)
+                create_match = re.match(r'create\s+(participant|actor)\s+([A-Za-z0-9_]+)(?:\s+as\s+(.+))?$', directive_text)
+                if create_match:
+                    actor_kind, actor_id, display_name = create_match.groups()
+                    actor_lookup.setdefault(
+                        actor_id,
+                        {
+                            "name": (display_name or actor_id).strip(),
+                            "kind": actor_kind,
+                            "participant_type": None,
+                        },
+                    )
+                continue
+
+            msg_match = SEQUENCE_MESSAGE_RE.match(line)
             if msg_match:
-                source, arrow, target, label = msg_match.groups()
+                source, source_central, base_arrow, target_central, target, label = msg_match.groups()
+                arrow = f'{source_central or ""}{base_arrow}{target_central or ""}'
                 msg_type = "sync"
-                if arrow == "->>":
-                    msg_type = "sync"
-                elif arrow == "-->>":
+                if base_arrow in {"-->>", "<<-->>"}:
                     msg_type = "return"
-                else:
+                elif "--" in base_arrow:
                     msg_type = "async"
-                message_rows.append((source, target, msg_type, label.strip()))
-                actor_lookup.setdefault(source, {"name": source})
-                actor_lookup.setdefault(target, {"name": target})
+                elif base_arrow in {"-)", "-x"}:
+                    msg_type = "async"
+                elif base_arrow in {"->>", "->", "<<->>", "-|\\", "-|/", "/|-", "\\\\-", "-\\\\", "-//", "//-"}:
+                    msg_type = "sync"
+                message_rows.append({
+                    "source": source,
+                    "target": target,
+                    "msg_type": msg_type,
+                    "label": label.strip(),
+                    "arrow": arrow,
+                    "directives_before": pending_directives[:],
+                })
+                pending_directives.clear()
+                actor_lookup.setdefault(source, {"name": source, "kind": "participant", "participant_type": None})
+                actor_lookup.setdefault(target, {"name": target, "kind": "participant", "participant_type": None})
 
         x = 100
         for actor_id, data in actor_lookup.items():
             actor = SequenceActor(self.canvas, x, 60, data["name"], self)
             actor.actor_id = actor_id
+            actor.actor_kind = data.get("kind", "participant")
+            actor.participant_type = data.get("participant_type")
+            actor.create_visual()
             self.sequence_actors.append(actor)
             x += 180
 
         actor_objects = {getattr(actor, "actor_id", actor.name): actor for actor in self.sequence_actors}
-        for index, (source, target, msg_type, label) in enumerate(message_rows):
+        for index, row in enumerate(message_rows):
+            source = row["source"]
+            target = row["target"]
             if source in actor_objects and target in actor_objects:
-                self.sequence_messages.append(
-                    SequenceMessage(self.canvas, actor_objects[source], actor_objects[target], msg_type, label, index, self)
+                message = SequenceMessage(
+                    self.canvas,
+                    actor_objects[source],
+                    actor_objects[target],
+                    row["msg_type"],
+                    row["label"],
+                    index,
+                    self,
                 )
+                message.arrow_symbol = row["arrow"]
+                message.directives_before = row["directives_before"]
+                message.update_position()
+                self.sequence_messages.append(message)
+
+        self.sequence_directives = pending_directives[:]
 
         self.update_scroll_region()
         self.update_status(f"Loaded sequence diagram with {len(self.sequence_actors)} participants")
@@ -5047,16 +6497,27 @@ class MermaidDiagramTool:
         entity_blocks = {}
         relationships = []
         current_entity = None
+        self.er_direction = None
+
+        def ensure_entity(reference):
+            entity_id, entity_alias = split_er_entity_reference(reference)
+            if entity_id not in entity_blocks:
+                entity_blocks[entity_id] = {"attrs": [], "alias": entity_alias}
+            elif entity_alias and not entity_blocks[entity_id].get("alias"):
+                entity_blocks[entity_id]["alias"] = entity_alias
+            return entity_id
 
         for raw_line in lines:
             line = raw_line.strip()
             if line.startswith("erDiagram"):
                 continue
+            if line.startswith("direction "):
+                self.er_direction = line.split(" ", 1)[1].strip()
+                continue
 
-            entity_start = re.match(r'([A-Za-z0-9_]+)\s*\{', line)
+            entity_start = re.match(r'((?:"[^"]+"|[A-Za-z0-9_-]+)(?:\[(?:"[^"]+"|[^\]]+)\])?)\s*\{', line)
             if entity_start:
-                current_entity = entity_start.group(1)
-                entity_blocks.setdefault(current_entity, [])
+                current_entity = ensure_entity(entity_start.group(1))
                 continue
 
             if line == "}":
@@ -5064,36 +6525,57 @@ class MermaidDiagramTool:
                 continue
 
             if current_entity:
-                entity_blocks[current_entity].append(line)
+                entity_blocks[current_entity]["attrs"].append(line)
                 continue
 
-            rel_match = re.match(r'([A-Za-z0-9_]+)\s+(\|\|--\|\||\|\|--o\{|\}o--o\{)\s+([A-Za-z0-9_]+)(?:\s*:\s*(.+))?', line)
+            rel_match = re.match(r'((?:"[^"]+"|[A-Za-z0-9_-]+))\s+(.+?)\s+((?:"[^"]+"|[A-Za-z0-9_-]+))(?:\s*:\s*(.+))?$', line)
             if rel_match:
-                left, symbol, right, label = rel_match.groups()
-                rel_type_map = {
-                    "||--||": "one-to-one",
-                    "||--o{": "one-to-many",
-                    "}o--o{": "many-to-many"
-                }
-                relationships.append((left, right, rel_type_map.get(symbol, "one-to-many"), (label or "").strip()))
-                entity_blocks.setdefault(left, [])
-                entity_blocks.setdefault(right, [])
+                left_ref, relation_text, right_ref, label = rel_match.groups()
+                left = ensure_entity(left_ref)
+                right = ensure_entity(right_ref)
+                parsed_relation = parse_er_relationship_syntax(relation_text)
+                if parsed_relation:
+                    relationships.append(
+                        (
+                            left,
+                            right,
+                            parsed_relation["rel_type"],
+                            (label or "").strip(),
+                            relation_text.strip(),
+                            parsed_relation["from_cardinality"],
+                            parsed_relation["to_cardinality"],
+                            parsed_relation["identifying"],
+                        )
+                    )
+                    continue
+
+            standalone_entity = re.match(r'((?:"[^"]+"|[A-Za-z0-9_-]+)(?:\[(?:"[^"]+"|[^\]]+)\])?)$', line)
+            if standalone_entity:
+                ensure_entity(standalone_entity.group(1))
 
         x, y = 150, 150
         entity_lookup = {}
-        for index, (entity_name, attrs) in enumerate(entity_blocks.items()):
-            entity = EREntity(self.canvas, x, y, entity_name, self)
-            entity.attributes = attrs
+        for index, (entity_id, entity_data) in enumerate(entity_blocks.items()):
+            display_name = entity_data.get("alias") or entity_id
+            entity = EREntity(self.canvas, x, y, display_name, self)
+            entity.entity_id = entity_id
+            entity.entity_alias = entity_data.get("alias")
+            entity.attributes = entity_data.get("attrs", [])
             self.er_entities.append(entity)
-            entity_lookup[entity_name] = entity
+            entity_lookup[entity_id] = entity
             x += 240
             if (index + 1) % 3 == 0:
                 x = 150
                 y += 170
 
-        for left, right, rel_type, label in relationships:
+        for left, right, rel_type, label, raw_relation, from_cardinality, to_cardinality, identifying in relationships:
             if left in entity_lookup and right in entity_lookup:
-                self.er_relationships.append(ERRelationship(self.canvas, entity_lookup[left], entity_lookup[right], rel_type, label, self))
+                relationship = ERRelationship(self.canvas, entity_lookup[left], entity_lookup[right], rel_type, label, self)
+                relationship.raw_relation = raw_relation
+                relationship.from_cardinality = from_cardinality
+                relationship.to_cardinality = to_cardinality
+                relationship.identifying = identifying
+                self.er_relationships.append(relationship)
 
         self.update_scroll_region()
         self.update_status(f"Loaded ER diagram with {len(self.er_entities)} entities")
@@ -5129,7 +6611,7 @@ class MermaidDiagramTool:
             if annotation_match:
                 class_name, annotation = annotation_match.groups()
                 if class_name not in classes_data:
-                    classes_data[class_name] = {'attributes': [], 'methods': [], 'annotations': [], 'stereotype': ''}
+                    classes_data[class_name] = {'attributes': [], 'methods': [], 'annotations': [], 'stereotype': '', 'display_label': class_name}
                 classes_data[class_name]['annotations'].append(annotation)
                 continue
             
@@ -5137,8 +6619,17 @@ class MermaidDiagramTool:
             if stereotype_match:
                 class_name, stereotype = stereotype_match.groups()
                 if class_name not in classes_data:
-                    classes_data[class_name] = {'attributes': [], 'methods': [], 'annotations': [], 'stereotype': ''}
+                    classes_data[class_name] = {'attributes': [], 'methods': [], 'annotations': [], 'stereotype': '', 'display_label': class_name}
                 classes_data[class_name]['stereotype'] = stereotype
+                continue
+
+            class_alias_match = re.match(r'\s*class\s+(\w+)\s*\[\s*"([^"]+)"\s*\]\s*$', line)
+            if class_alias_match:
+                class_name, display_label = class_alias_match.groups()
+                if class_name not in classes_data:
+                    classes_data[class_name] = {'attributes': [], 'methods': [], 'annotations': [], 'stereotype': '', 'display_label': display_label}
+                else:
+                    classes_data[class_name]['display_label'] = display_label
                 continue
                 
             # Parse class definition start
@@ -5146,7 +6637,14 @@ class MermaidDiagramTool:
             if class_match:
                 current_class = class_match.group(1)
                 if current_class not in classes_data:
-                    classes_data[current_class] = {'attributes': [], 'methods': [], 'annotations': [], 'stereotype': ''}
+                    classes_data[current_class] = {'attributes': [], 'methods': [], 'annotations': [], 'stereotype': '', 'display_label': current_class}
+                continue
+
+            standalone_class_match = re.match(r'\s*class\s+(\w+)\s*$', line)
+            if standalone_class_match:
+                class_name = standalone_class_match.group(1)
+                if class_name not in classes_data:
+                    classes_data[class_name] = {'attributes': [], 'methods': [], 'annotations': [], 'stereotype': '', 'display_label': class_name}
                 continue
             
             # Parse class definition end
@@ -5197,6 +6695,16 @@ class MermaidDiagramTool:
                     else:
                         from_class, to_class = class1, class2
                         from_mult, to_mult = mult1 or "", mult2 or ""
+
+                    for class_name in (from_class, to_class):
+                        if class_name not in classes_data:
+                            classes_data[class_name] = {
+                                'attributes': [],
+                                'methods': [],
+                                'annotations': [],
+                                'stereotype': '',
+                                'display_label': class_name,
+                            }
                     
                     relationships.append({
                         'from': from_class,
@@ -5214,7 +6722,9 @@ class MermaidDiagramTool:
         
         for i, (class_name, class_data) in enumerate(classes_data.items()):
             x, y = class_positions[i]
-            class_box = ClassBox(self.canvas, x, y, class_name, self)
+            class_box = ClassBox(self.canvas, x, y, class_data.get('display_label', class_name), self)
+            class_box.class_id = class_name
+            class_box.display_label = class_data.get('display_label', class_name)
             class_box.attributes = class_data['attributes']
             class_box.methods = class_data['methods']
             class_box.annotations = class_data['annotations']
@@ -5586,7 +7096,14 @@ class MermaidDiagramTool:
         for actor in self.sequence_actors:
             actor_name = actor.name.replace("\n", " ").strip() or "Actor"
             actor_id = getattr(actor, "actor_id", actor_name.replace(" ", "_"))
-            lines.append(f"    participant {actor_id} as {actor_name}")
+            actor_kind = getattr(actor, "actor_kind", "participant")
+            participant_type = getattr(actor, "participant_type", None)
+            declaration = f"    {actor_kind} {actor_id}"
+            if participant_type:
+                declaration += f'@{{ "type": "{participant_type}" }}'
+            if actor_name != actor_id:
+                declaration += f" as {actor_name}"
+            lines.append(declaration)
         arrow_map = {
             "sync": "->>",
             "async": "-->",
@@ -5594,10 +7111,16 @@ class MermaidDiagramTool:
             "note": "--"
         }
         for message in self.sequence_messages:
+            for directive in getattr(message, "directives_before", []):
+                lines.append(f"    {directive}")
             source = getattr(message.from_actor, "actor_id", message.from_actor.name.replace(" ", "_"))
             target = getattr(message.to_actor, "actor_id", message.to_actor.name.replace(" ", "_"))
-            symbol = arrow_map.get(message.msg_type, "->>")
-            lines.append(f"    {source} {symbol} {target} : {message.label}")
+            symbol = getattr(message, "arrow_symbol", arrow_map.get(message.msg_type, "->>"))
+            left_sep = "" if symbol.startswith("()") else " "
+            right_sep = "" if symbol.endswith("()") else " "
+            lines.append(f"    {source}{left_sep}{symbol}{right_sep}{target} : {message.label}")
+        for directive in self.sequence_directives:
+            lines.append(f"    {directive}")
         return '\n'.join(lines)
 
     def generate_state_diagram(self):
@@ -5614,9 +7137,16 @@ class MermaidDiagramTool:
 
     def generate_er_diagram(self):
         lines = ["erDiagram"]
+        if self.er_direction:
+            lines.append(f"    direction {self.er_direction}")
         for entity in self.er_entities:
-            entity_name = entity.name.replace(" ", "_").upper() or "ENTITY"
-            lines.append(f"    {entity_name} {{")
+            entity_id = getattr(entity, "entity_id", entity.name.replace(" ", "_").upper()) or "ENTITY"
+            entity_alias = getattr(entity, "entity_alias", None)
+            entity_header = entity_id
+            if entity_alias and entity_alias != entity_id:
+                escaped_alias = entity_alias.replace('"', '\\"')
+                entity_header = f'{entity_id}["{escaped_alias}"]'
+            lines.append(f"    {entity_header} {{")
             for attr in entity.attributes:
                 lines.append(f"        {attr}")
             lines.append("    }")
@@ -5626,9 +7156,10 @@ class MermaidDiagramTool:
             "many-to-many": "}o--o{"
         }
         for relation in self.er_relationships:
-            left = relation.from_entity.name.replace(" ", "_").upper()
-            right = relation.to_entity.name.replace(" ", "_").upper()
-            line = f"    {left} {symbol_map.get(relation.rel_type, '||--o{')} {right}"
+            left = getattr(relation.from_entity, "entity_id", relation.from_entity.name.replace(" ", "_").upper())
+            right = getattr(relation.to_entity, "entity_id", relation.to_entity.name.replace(" ", "_").upper())
+            relation_symbol = getattr(relation, "raw_relation", None) or symbol_map.get(relation.rel_type, '||--o{')
+            line = f"    {left} {relation_symbol} {right}"
             if relation.label:
                 line += f" : {relation.label}"
             lines.append(line)
@@ -5639,7 +7170,15 @@ class MermaidDiagramTool:
         
         # Add classes with enhanced features
         for class_box in self.classes:
-            class_name = class_box.name.replace(" ", "_")
+            class_name = getattr(class_box, "class_id", class_box.name.replace(" ", "_"))
+            display_label = getattr(class_box, "display_label", class_box.name)
+            has_details = bool(class_box.attributes or class_box.methods or class_box.annotations or class_box.stereotype or class_box.notes)
+            if display_label != class_name:
+                escaped_label = display_label.replace('"', '\\"')
+                lines.append(f'    class {class_name}["{escaped_label}"]')
+            elif not has_details:
+                lines.append(f"    class {class_name}")
+                continue
             
             # Add annotations
             for annotation in class_box.annotations:
@@ -5649,6 +7188,9 @@ class MermaidDiagramTool:
             if class_box.stereotype:
                 lines.append(f"    {class_name} : <<{class_box.stereotype}>>")
             
+            if not has_details:
+                continue
+
             lines.append(f"    class {class_name} {{")
             
             # Add attributes with proper formatting
@@ -5669,8 +7211,8 @@ class MermaidDiagramTool:
             
         # Add relationships with enhanced syntax
         for rel in self.relationships:
-            from_name = rel.from_class.name.replace(" ", "_")
-            to_name = rel.to_class.name.replace(" ", "_")
+            from_name = getattr(rel.from_class, "class_id", rel.from_class.name.replace(" ", "_"))
+            to_name = getattr(rel.to_class, "class_id", rel.to_class.name.replace(" ", "_"))
             
             if rel.rel_type == "inheritance":
                 rel_line = f"    {to_name}"
@@ -5828,7 +7370,7 @@ class MermaidDiagramTool:
         # Save each class position (normalized to zoom 1.0)
         for class_box in self.classes:
             try:
-                class_name = class_box.name.replace(" ", "_")
+                class_name = getattr(class_box, "class_id", class_box.name.replace(" ", "_"))
                 # Normalize positions to zoom 1.0 for consistent loading
                 normalized_x = class_box.x / self.zoom_level if self.zoom_level > 0 else class_box.x
                 normalized_y = class_box.y / self.zoom_level if self.zoom_level > 0 else class_box.y
@@ -5875,7 +7417,7 @@ class MermaidDiagramTool:
             }
 
         for entity in self.er_entities:
-            entity_key = entity.name.replace(" ", "_").upper()
+            entity_key = getattr(entity, "entity_id", entity.name.replace(" ", "_").upper())
             positions["er_entities"][entity_key] = {
                 "x": float(entity.x / self.zoom_level if self.zoom_level > 0 else entity.x),
                 "y": float(entity.y / self.zoom_level if self.zoom_level > 0 else entity.y)
@@ -5953,7 +7495,7 @@ class MermaidDiagramTool:
             # Apply positions to each class (scale from normalized to current zoom)
             applied_count = 0
             for class_box in self.classes:
-                class_name = class_box.name.replace(" ", "_")
+                class_name = getattr(class_box, "class_id", class_box.name.replace(" ", "_"))
                 if class_name in class_positions:
                     pos = class_positions[class_name]
                     
@@ -6012,7 +7554,7 @@ class MermaidDiagramTool:
                     self.canvas.move(state.text_item, dx, dy)
 
             for entity in self.er_entities:
-                entity_key = entity.name.replace(" ", "_").upper()
+                entity_key = getattr(entity, "entity_id", entity.name.replace(" ", "_").upper())
                 if entity_key in entity_positions:
                     pos = entity_positions[entity_key]
                     dx = (pos["x"] * self.zoom_level) - entity.x
