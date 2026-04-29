@@ -1,1 +1,1 @@
-c:\Users\Les Farrell\OneDrive\Documents\Vibe Coding\Mermaid Diagram Editor\sample_er_diagram.md
+C:\Users\Les Farrell\OneDrive\Documents\Vibe Coding\Mermaid Diagram Editor\samples\sample_class_diagram.md

@@ -6,6 +6,9 @@ import json
 import math
 import re
 import os
+import shutil
+import subprocess
+import sys
 import tempfile
 
 try:
@@ -15,6 +18,16 @@ except ImportError:
     ImageColor = None
     ImageDraw = None
     ImageFont = None
+
+SURFACE_BG = "#f4f7fb"
+PANEL_BG = "#e9eff6"
+PANEL_EDGE = "#cfdae8"
+CANVAS_BG = "#fbfdff"
+TEXT_PRIMARY = "#1f2d3d"
+TEXT_MUTED = "#607086"
+ACCENT = "#2d8cff"
+SUCCESS = "#9fd46b"
+WARNING = "#ffd97a"
 
 try:
     from tksvg import SvgImage
@@ -73,6 +86,40 @@ def get_endpoint_label_position(point, other_point, along_offset, perpendicular_
 def get_centered_text_width(width, ratio, minimum=40):
     """Compute a reasonable wrapped text width inside a scaled shape."""
     return max(minimum, int(width * ratio))
+
+
+def create_rounded_rectangle(canvas, x1, y1, x2, y2, radius, **kwargs):
+    """Draw a rounded rectangle on a Tk canvas using a smoothed polygon."""
+    radius = max(0, min(radius, abs(x2 - x1) / 2, abs(y2 - y1) / 2))
+    if radius <= 1:
+        return canvas.create_rectangle(x1, y1, x2, y2, **kwargs)
+
+    points = [
+        x1 + radius, y1,
+        x2 - radius, y1,
+        x2, y1,
+        x2, y1 + radius,
+        x2, y2 - radius,
+        x2, y2,
+        x2 - radius, y2,
+        x1 + radius, y2,
+        x1, y2,
+        x1, y2 - radius,
+        x1, y1 + radius,
+        x1, y1,
+    ]
+    return canvas.create_polygon(points, smooth=True, splinesteps=20, **kwargs)
+
+
+def measure_wrapped_text(canvas, text, font, target_width, minimum_width=80, max_width=320):
+    """Measure wrapped text and return a practical text box size."""
+    width = max(minimum_width, min(max_width, int(target_width)))
+    temp_text = canvas.create_text(0, 0, text=text, font=font, width=width, justify="center")
+    bbox = canvas.bbox(temp_text)
+    canvas.delete(temp_text)
+    if not bbox:
+        return width, 20
+    return bbox[2] - bbox[0], bbox[3] - bbox[1]
 
 
 def unquote_mermaid_string(value):
@@ -143,6 +190,10 @@ SEQUENCE_MESSAGE_RE = re.compile(
     rf'([A-Za-z0-9_]+)\s*(\(\))?\s*({SEQUENCE_ARROW_PATTERN})\s*(\(\))?\s*([A-Za-z0-9_]+)\s*:\s*(.+)'
 )
 
+FLOWCHART_NODE_REFERENCE_RE = re.compile(
+    r'^\s*([A-Za-z0-9_]+)(?:\(\((.+)\)\)|\((.+)\)|\[([^\]]+)\]|\{([^}]+)\})?\s*$'
+)
+
 
 def normalize_er_cardinality_text(value):
     """Normalize Mermaid ER cardinality syntax into a compact display value."""
@@ -169,6 +220,14 @@ def normalize_er_cardinality_text(value):
         "0+": "0..N",
     }
     return mapping.get(normalized, value.strip())
+
+
+def get_runtime_base_dir():
+    """Return the directory the app should use for bundled/runtime files."""
+    compiled = globals().get("__compiled__")
+    if compiled is not None and hasattr(compiled, "containing_dir"):
+        return compiled.containing_dir
+    return os.path.dirname(os.path.abspath(__file__))
 
 
 def infer_er_rel_type(from_cardinality, to_cardinality):
@@ -400,6 +459,51 @@ def place_text_near_line(
 
     if fallback is not None:
         canvas.coords(text_item, fallback[0], fallback[1])
+
+
+def position_connection_label(
+    canvas,
+    text_item,
+    from_point,
+    to_point,
+    obstacle_bboxes=None,
+    preferred_side=1,
+    base_offset=12,
+    padding=2,
+    line_item=None,
+    exclude_items=None,
+):
+    """Place a connection label near its line while avoiding nodes and other text."""
+    obstacles = [bbox for bbox in (obstacle_bboxes or []) if bbox]
+    excluded = set(exclude_items or [])
+    excluded.add(text_item)
+    if line_item:
+        excluded.add(line_item)
+
+    for item in canvas.find_all():
+        if item in excluded or "grid" in canvas.gettags(item):
+            continue
+        if canvas.type(item) != "text":
+            continue
+        bbox = canvas.bbox(item)
+        if bbox:
+            obstacles.append(bbox)
+
+    place_text_near_line(
+        canvas,
+        text_item,
+        from_point,
+        to_point,
+        obstacles,
+        preferred_side=preferred_side,
+        base_offset=base_offset,
+        padding=padding,
+    )
+
+    if line_item:
+        canvas.tag_raise(text_item, line_item)
+    else:
+        canvas.tag_raise(text_item)
 
 
 def intersects_bboxes(a, b, padding=0):
@@ -1228,7 +1332,7 @@ class Relationship:
                     text=self.label, font=("Arial", label_font_size),
                     fill="blue", anchor="center"
                 )
-                place_text_near_line(
+                position_connection_label(
                     self.canvas,
                     self.label_text,
                     from_point,
@@ -1243,9 +1347,8 @@ class Relationship:
                     preferred_side=1,
                     base_offset=int(12 * zoom_level),
                     padding=2,
+                    line_item=self.line,
                 )
-                # Keep label behind classes
-                self.canvas.tag_lower(self.label_text)
                 self.canvas.tag_bind(self.label_text, "<Button-1>", self.on_click)
                 self.canvas.tag_bind(self.label_text, "<Double-Button-1>", self.on_double_click)
             
@@ -1804,10 +1907,41 @@ class FlowchartNode:
         if hasattr(self, 'text_item'):
             self.canvas.delete(self.text_item)
         
-        # Scale dimensions
-        w = self.width * zoom_level
-        h = self.height * zoom_level
-        
+        font_size = max(8, int(10 * zoom_level))
+        if self.shape == "diamond":
+            base_target_width = self.width * zoom_level * 0.55
+        elif self.shape == "circle":
+            base_target_width = self.width * zoom_level * 0.7
+        else:
+            base_target_width = self.width * zoom_level * 0.8
+
+        text_width, text_height = measure_wrapped_text(
+            self.canvas,
+            self.text,
+            ("Arial", font_size),
+            base_target_width,
+            minimum_width=max(70, int(72 * zoom_level)),
+            max_width=max(180, int(240 * zoom_level)),
+        )
+        horizontal_padding = max(26, int(32 * zoom_level))
+        vertical_padding = max(18, int(22 * zoom_level))
+
+        base_w = max(self.width * zoom_level, text_width + horizontal_padding)
+        base_h = max(self.height * zoom_level, text_height + vertical_padding)
+        if self.shape == "diamond":
+            w = max(base_w, text_width * 1.75)
+            h = max(base_h, text_height * 2.0)
+        elif self.shape == "circle":
+            diameter = max(base_w, base_h)
+            w = diameter
+            h = diameter
+        else:
+            w = base_w
+            h = base_h
+
+        self.width = max(80, w / zoom_level)
+        self.height = max(50, h / zoom_level)
+
         # Draw shape based on type
         if self.shape == "rectangle":
             self.shape_item = self.canvas.create_rectangle(
@@ -1815,8 +1949,10 @@ class FlowchartNode:
                 fill="lightblue", outline="black", width=max(1, int(2 * zoom_level))
             )
         elif self.shape == "rounded":
-            self.shape_item = self.canvas.create_rectangle(
+            self.shape_item = create_rounded_rectangle(
+                self.canvas,
                 self.x, self.y, self.x + w, self.y + h,
+                radius=max(10, int(14 * zoom_level)),
                 fill="lightgreen", outline="black", width=max(1, int(2 * zoom_level))
             )
         elif self.shape == "diamond":
@@ -1831,19 +1967,12 @@ class FlowchartNode:
                 fill="lightcoral", outline="black", width=max(1, int(2 * zoom_level))
             )
         
-        # Draw text
-        font_size = max(8, int(10 * zoom_level))
-        text_width_ratio = 0.8
-        if self.shape == "diamond":
-            text_width_ratio = 0.55
-        elif self.shape == "circle":
-            text_width_ratio = 0.7
         self.text_item = self.canvas.create_text(
             self.x + w/2, self.y + h/2,
             text=self.text,
             font=("Arial", font_size),
             tags="node_text",
-            width=get_centered_text_width(w, text_width_ratio),
+            width=max(50, int(text_width)),
             justify="center"
         )
         
@@ -1892,8 +2021,10 @@ class FlowchartNode:
         new_text = simpledialog.askstring("Edit Node", "Enter node text:", initialvalue=self.text)
         if new_text:
             self.text = new_text
-            self.canvas.itemconfig(self.text_item, text=new_text)
+            self.create_visual()
             if self.tool:
+                self.tool.update_relationships()
+                self.tool.update_scroll_region()
                 self.tool.mark_as_changed()
     
     def select(self):
@@ -2514,14 +2645,101 @@ class SequenceActor:
     def delete(self):
         self.delete_visual_items()
 
+
+class SequenceNote:
+    def __init__(self, canvas, placement, actors, text, row_index=0, tool=None):
+        self.canvas = canvas
+        self.tool = tool
+        self.placement = placement
+        self.actors = actors
+        self.text = text
+        self.row_index = row_index
+        self.box = None
+        self.text_item = None
+        self.fold_line = None
+        self.create_visual()
+
+    def get_anchor_points(self):
+        actor_centers = [actor.get_center()[0] for actor in self.actors if actor]
+        actor_tops = [actor.primary_bbox[1] for actor in self.actors if getattr(actor, "primary_bbox", None)]
+        if not actor_centers:
+            return 160, 120
+        x = sum(actor_centers) / len(actor_centers)
+        top = min(actor_tops) if actor_tops else 60
+        y = top + ((self.row_index + 1) * 50)
+        if self.placement == "left of":
+            x -= 120
+        elif self.placement == "right of":
+            x += 120
+        return x, y
+
+    def create_visual(self):
+        zoom_level = self.tool.zoom_level if self.tool and hasattr(self.tool, 'zoom_level') else 1.0
+        self.delete()
+        x, y = self.get_anchor_points()
+        font = ("Arial", max(8, int(9 * zoom_level)))
+        note_width = max(120, int(140 * zoom_level))
+        text_width, text_height = measure_wrapped_text(
+            self.canvas,
+            self.text,
+            font,
+            note_width * 0.82,
+            minimum_width=max(90, int(100 * zoom_level)),
+            max_width=max(180, int(220 * zoom_level)),
+        )
+        w = max(note_width, text_width + max(20, int(22 * zoom_level)))
+        h = max(int(46 * zoom_level), text_height + max(16, int(18 * zoom_level)))
+        left = x - (w / 2)
+        top = y - h - max(18, int(20 * zoom_level))
+        fold = max(12, int(14 * zoom_level))
+        self.box = self.canvas.create_polygon(
+            left, top,
+            left + w - fold, top,
+            left + w, top + fold,
+            left + w, top + h,
+            left, top + h,
+            fill="#fff4c2",
+            outline="#9c7a00",
+            width=max(1, int(2 * zoom_level)),
+        )
+        self.fold_line = self.canvas.create_line(
+            left + w - fold, top,
+            left + w - fold, top + fold,
+            left + w, top + fold,
+            fill="#9c7a00",
+            width=max(1, int(1 * zoom_level)),
+        )
+        self.text_item = self.canvas.create_text(
+            left + (w / 2),
+            top + (h / 2),
+            text=self.text,
+            font=font,
+            width=max(70, int(text_width)),
+            justify="center",
+            fill="#5c4500",
+        )
+        for item in [self.box, self.fold_line, self.text_item]:
+            self.canvas.tag_raise(item)
+
+    def update_position(self):
+        self.create_visual()
+
+    def delete(self):
+        for item_name in ("box", "fold_line", "text_item"):
+            item = getattr(self, item_name, None)
+            if item:
+                self.canvas.delete(item)
+                setattr(self, item_name, None)
+
 class StateNode:
     """Represents a state in a state diagram"""
-    def __init__(self, canvas, x, y, name="State", tool=None):
+    def __init__(self, canvas, x, y, name="State", tool=None, state_kind="normal"):
         self.canvas = canvas
         self.tool = tool
         self.x = x
         self.y = y
         self.name = name
+        self.state_kind = state_kind
         self.width = 100
         self.height = 50
         self.selected = False
@@ -2537,22 +2755,65 @@ class StateNode:
             self.canvas.delete(self.box)
         if hasattr(self, 'text_item'):
             self.canvas.delete(self.text_item)
+
+        if self.state_kind in {"start", "end"}:
+            radius = max(10, int(12 * zoom_level))
+            outer_radius = radius + max(4, int(5 * zoom_level))
+            center_x = self.x + outer_radius
+            center_y = self.y + outer_radius
+            self.width = (outer_radius * 2) / zoom_level
+            self.height = (outer_radius * 2) / zoom_level
+            if self.state_kind == "end":
+                self.box = self.canvas.create_oval(
+                    center_x - outer_radius, center_y - outer_radius,
+                    center_x + outer_radius, center_y + outer_radius,
+                    fill="white", outline="black", width=max(1, int(2 * zoom_level))
+                )
+                self.text_item = self.canvas.create_oval(
+                    center_x - radius, center_y - radius,
+                    center_x + radius, center_y + radius,
+                    fill="black", outline="black", width=max(1, int(1 * zoom_level))
+                )
+            else:
+                self.box = self.canvas.create_oval(
+                    center_x - radius, center_y - radius,
+                    center_x + radius, center_y + radius,
+                    fill="black", outline="black", width=max(1, int(1 * zoom_level))
+                )
+                self.text_item = None
+            for item in [self.box] + ([self.text_item] if self.text_item else []):
+                self.canvas.tag_bind(item, "<Button-1>", self.on_press)
+                self.canvas.tag_bind(item, "<B1-Motion>", self.on_drag)
+                self.canvas.tag_bind(item, "<ButtonRelease-1>", self.on_release)
+            return
         
-        w = self.width * zoom_level
-        h = self.height * zoom_level
-        
+        font_size = max(8, int(10 * zoom_level))
+        text_width, text_height = measure_wrapped_text(
+            self.canvas,
+            self.name,
+            ("Arial", font_size, "bold"),
+            self.width * zoom_level * 0.78,
+            minimum_width=max(70, int(76 * zoom_level)),
+            max_width=max(180, int(220 * zoom_level)),
+        )
+        w = max(self.width * zoom_level, text_width + max(24, int(28 * zoom_level)))
+        h = max(self.height * zoom_level, text_height + max(18, int(22 * zoom_level)))
+        self.width = max(90, w / zoom_level)
+        self.height = max(50, h / zoom_level)
+
         # Draw rounded rectangle for state
-        self.box = self.canvas.create_rectangle(
+        self.box = create_rounded_rectangle(
+            self.canvas,
             self.x, self.y, self.x + w, self.y + h,
+            radius=max(12, int(16 * zoom_level)),
             fill="lightgreen", outline="black", width=max(1, int(2 * zoom_level))
         )
         
-        font_size = max(8, int(10 * zoom_level))
         self.text_item = self.canvas.create_text(
             self.x + w/2, self.y + h/2,
             text=self.name,
             font=("Arial", font_size, "bold"),
-            width=get_centered_text_width(w, 0.8),
+            width=max(50, int(text_width)),
             justify="center"
         )
         
@@ -2598,11 +2859,15 @@ class StateNode:
             self.tool.save_positions()
     
     def on_double_click(self, event):
+        if self.state_kind in {"start", "end"}:
+            return "break"
         new_name = simpledialog.askstring("Edit State", "Enter state name:", initialvalue=self.name)
         if new_name:
             self.name = new_name
-            self.canvas.itemconfig(self.text_item, text=new_name)
+            self.create_visual()
             if self.tool:
+                self.tool.update_relationships()
+                self.tool.update_scroll_region()
                 self.tool.mark_as_changed()
     
     def select(self):
@@ -2625,7 +2890,8 @@ class StateNode:
 
     def delete(self):
         self.canvas.delete(self.box)
-        self.canvas.delete(self.text_item)
+        if self.text_item:
+            self.canvas.delete(self.text_item)
 
 class EREntity:
     """Represents an entity in an ER diagram"""
@@ -2654,21 +2920,31 @@ class EREntity:
         if hasattr(self, 'text_item'):
             self.canvas.delete(self.text_item)
         
-        w = self.width * zoom_level
-        h = self.height * zoom_level
-        
+        font_size = max(8, int(10 * zoom_level))
+        text_width, text_height = measure_wrapped_text(
+            self.canvas,
+            self.name,
+            ("Arial", font_size, "bold"),
+            self.width * zoom_level * 0.78,
+            minimum_width=max(70, int(76 * zoom_level)),
+            max_width=max(200, int(240 * zoom_level)),
+        )
+        w = max(self.width * zoom_level, text_width + max(26, int(30 * zoom_level)))
+        h = max(self.height * zoom_level, text_height + max(24, int(28 * zoom_level)))
+        self.width = max(100, w / zoom_level)
+        self.height = max(60, h / zoom_level)
+
         # Draw entity box
         self.box = self.canvas.create_rectangle(
             self.x, self.y, self.x + w, self.y + h,
             fill="lightyellow", outline="black", width=max(1, int(2 * zoom_level))
         )
         
-        font_size = max(8, int(10 * zoom_level))
         self.text_item = self.canvas.create_text(
             self.x + w/2, self.y + h/2,
             text=self.name,
             font=("Arial", font_size, "bold"),
-            width=get_centered_text_width(w, 0.8),
+            width=max(50, int(text_width)),
             justify="center"
         )
         
@@ -2717,8 +2993,10 @@ class EREntity:
         new_name = simpledialog.askstring("Edit Entity", "Enter entity name:", initialvalue=self.name)
         if new_name:
             self.name = new_name
-            self.canvas.itemconfig(self.text_item, text=new_name)
+            self.create_visual()
             if self.tool:
+                self.tool.update_relationships()
+                self.tool.update_scroll_region()
                 self.tool.mark_as_changed()
     
     def select(self):
@@ -2760,6 +3038,11 @@ class FlowchartConnection:
     def get_connection_points(self):
         return self.from_node.get_center(), self.to_node.get_center()
 
+    def get_label_side(self):
+        from_id = getattr(self.from_node, "node_id", "")
+        to_id = getattr(self.to_node, "node_id", "")
+        return 1 if from_id <= to_id else -1
+
     def create_visual(self):
         from_point, to_point = self.get_connection_points()
         color = "red" if self.selected else "#2f3640"
@@ -2790,12 +3073,15 @@ class FlowchartConnection:
         self.canvas.tag_bind(self.line, "<Double-Button-1>", self.on_double_click)
 
         if self.label:
-            mid_x, mid_y = get_perpendicular_label_position(from_point, to_point, int(12 * zoom_level))
+            label_side = self.get_label_side()
+            mid_x, mid_y = get_perpendicular_label_position(
+                from_point, to_point, int(12 * zoom_level), side=label_side
+            )
             self.label_text = self.canvas.create_text(
                 mid_x, mid_y, text=self.label,
                 font=("Arial", max(8, int(9 * zoom_level))), fill="#0c2461"
             )
-            place_text_near_line(
+            position_connection_label(
                 self.canvas,
                 self.label_text,
                 from_point,
@@ -2804,11 +3090,11 @@ class FlowchartConnection:
                     self.canvas.bbox(self.from_node.shape_item),
                     self.canvas.bbox(self.to_node.shape_item),
                 ],
-                preferred_side=1,
+                preferred_side=label_side,
                 base_offset=int(12 * zoom_level),
                 padding=2,
+                line_item=self.line,
             )
-            self.canvas.tag_lower(self.label_text)
             self.canvas.tag_bind(self.label_text, "<Button-1>", self.on_click)
             self.canvas.tag_bind(self.label_text, "<Double-Button-1>", self.on_double_click)
 
@@ -3088,6 +3374,9 @@ class SequenceMessage:
         color = "red" if self.selected else "#2d3436"
         width = max(1, int((3 if self.selected else 2) * zoom_level))
         self.delete()
+        label_from_point = (from_x, y)
+        label_to_point = (to_x, y)
+        label_side = -1
 
         if self.msg_type == "note":
             self.line = self.register_item(
@@ -3113,6 +3402,8 @@ class SequenceMessage:
             self.line = self.register_item(
                 self.canvas.create_line(*points, fill=color, width=width, dash=dash, smooth=False)
             )
+            label_from_point = (from_x, y)
+            label_to_point = (from_x + loop_width, y)
             self.lower_item(self.line)
             self.bind_item(self.line)
             for item in self.draw_marker(
@@ -3149,6 +3440,8 @@ class SequenceMessage:
             self.line = self.register_item(
                 self.canvas.create_line(line_start_x, y, line_end_x, y, fill=color, width=width, dash=dash)
             )
+            label_from_point = (line_start_x, y)
+            label_to_point = (line_end_x, y)
             self.lower_item(self.line)
             self.bind_item(self.line)
 
@@ -3187,19 +3480,33 @@ class SequenceMessage:
                     self.bind_item(item)
 
         label_fill = "#6c5ce7" if self.msg_type != "note" else "#b9770e"
-        label_x = (from_x + to_x) / 2
-        if from_x == to_x:
-            label_x = from_x + max(18, int(22 * zoom_level))
         self.label_text = self.register_item(
             self.canvas.create_text(
-                label_x,
+                (label_from_point[0] + label_to_point[0]) / 2,
                 y - (12 * zoom_level),
                 text=self.label,
                 font=("Arial", max(8, int(9 * zoom_level))),
                 fill=label_fill,
             )
         )
-        self.lower_item(self.label_text)
+        actor_obstacles = []
+        for actor in self.tool.sequence_actors if self.tool else [self.from_actor, self.to_actor]:
+            for item_name in ("box", "text_item"):
+                obstacle_item = getattr(actor, item_name, None)
+                if obstacle_item:
+                    actor_obstacles.append(self.canvas.bbox(obstacle_item))
+        position_connection_label(
+            self.canvas,
+            self.label_text,
+            label_from_point,
+            label_to_point,
+            actor_obstacles,
+            preferred_side=label_side,
+            base_offset=int(12 * zoom_level),
+            padding=2,
+            line_item=self.line,
+            exclude_items=self.visual_items,
+        )
         self.bind_item(self.label_text)
 
     def update_position(self):
@@ -3285,7 +3592,7 @@ class StateTransition:
                 text=self.label,
                 font=("Arial", max(8, int(9 * zoom_level))), fill="#145a32"
             )
-            place_text_near_line(
+            position_connection_label(
                 self.canvas,
                 self.label_text,
                 from_point,
@@ -3300,8 +3607,8 @@ class StateTransition:
                 preferred_side=label_side,
                 base_offset=int(12 * zoom_level),
                 padding=2,
+                line_item=self.line,
             )
-            self.canvas.tag_lower(self.label_text)
             self.canvas.tag_bind(self.label_text, "<Button-1>", self.on_click)
             self.canvas.tag_bind(self.label_text, "<Double-Button-1>", self.on_double_click)
 
@@ -3428,7 +3735,7 @@ class ERRelationship:
                 text=self.label,
                 font=("Arial", max(8, int(9 * zoom_level))), fill="#935116"
             )
-            place_text_near_line(
+            position_connection_label(
                 self.canvas,
                 self.label_text,
                 from_point,
@@ -3443,8 +3750,8 @@ class ERRelationship:
                 preferred_side=1,
                 base_offset=int(12 * zoom_level),
                 padding=2,
+                line_item=self.line,
             )
-            self.canvas.tag_raise(self.label_text)
             self.canvas.tag_bind(self.label_text, "<Button-1>", self.on_click)
             self.canvas.tag_bind(self.label_text, "<Double-Button-1>", self.on_double_click)
 
@@ -3485,25 +3792,33 @@ class ERRelationship:
                 setattr(self, item_name, None)
 
 class MermaidDiagramTool:
-    def __init__(self):
+    def __init__(self, startup_file=None):
         self.root = tk.Tk()
         self.root.title("Mermaid Diagram Tool")
         self.root.geometry("1440x900")
         self.root.minsize(1280, 780)
+        self.startup_file = self.resolve_startup_file(startup_file)
         
         self.diagram_type = "classDiagram"  # or "flowchart", "sequenceDiagram", "stateDiagram", "erDiagram"
         self.classes = []
         self.flowchart_nodes = []  # For flowchart mode
         self.flowchart_connections = []
+        self.flowchart_direction = "TD"
+        self.flowchart_preserved_lines = []
         self.sequence_actors = []  # For sequence diagram
         self.sequence_messages = []  # For sequence diagram
+        self.sequence_notes = []
         self.sequence_directives = []
+        self.sequence_export_rows = []
         self.state_nodes = []  # For state diagram
         self.state_transitions = []  # For state diagram
+        self.state_preserved_lines = []
         self.er_entities = []  # For ER diagram
         self.er_relationships = []  # For ER diagram
         self.er_direction = None
+        self.er_preserved_lines = []
         self.relationships = []
+        self.class_preserved_lines = []
         self.selected_class = None
         self.selected_node = None  # For flowchart mode
         self.selected_item = None  # Generic selection for other diagram types
@@ -3515,11 +3830,15 @@ class MermaidDiagramTool:
         self.pan_start_y = 0
         self.is_panning = False  # Track if currently panning
         self.canvas_svg_exports = {}
+        self.palette_panel_visible = True
+        self.preview_panel_visible = True
+        self.top_controls_visible = True
         
         # Track changes and current file
         self.has_unsaved_changes = False
         self.current_file = None
-        self.config_file = "mermaid_tool_config.txt"
+        self.runtime_base_dir = get_runtime_base_dir()
+        self.config_file = os.path.join(self.runtime_base_dir, "mermaid_tool_config.txt")
         self.debug_logging = False
         
         self.create_widgets()
@@ -3528,8 +3847,23 @@ class MermaidDiagramTool:
         # Set up window close handler
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
-        # Load last used diagram
-        self.load_last_diagram()
+        # Open an explicit startup file first, otherwise restore the last file.
+        if not self.load_startup_diagram():
+            self.load_last_diagram()
+
+    def resolve_startup_file(self, startup_file):
+        if not startup_file:
+            return None
+        return os.path.abspath(os.path.expanduser(startup_file))
+
+    def load_startup_diagram(self):
+        if not self.startup_file:
+            return False
+        return self.load_diagram_from_file(
+            self.startup_file,
+            prompt_for_unsaved=False,
+            show_errors=True,
+        )
         
     def create_widgets(self):
         self.root.configure(bg="#f3f6fb")
@@ -3547,12 +3881,22 @@ class MermaidDiagramTool:
         file_menu.add_separator()
         file_menu.add_command(label="Export PNG", command=self.export_png)
         file_menu.add_command(label="Export SVG", command=self.export_svg)
+
+        layout_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Layout", menu=layout_menu)
+        layout_menu.add_command(label="Auto Layout", command=self.apply_auto_layout)
+        layout_menu.add_separator()
+        layout_menu.add_command(label="Toggle Top Bar", command=self.toggle_top_controls)
+        layout_menu.add_command(label="Toggle Tools Panel", command=self.toggle_palette_panel)
+        layout_menu.add_command(label="Toggle Code Panel", command=self.toggle_preview_panel)
+        layout_menu.add_command(label="Canvas Focus Mode", command=self.toggle_canvas_focus_mode)
         
         app_shell = tk.Frame(self.root, bg="#f3f6fb")
         app_shell.pack(fill=tk.BOTH, expand=True, padx=14, pady=14)
 
         header = tk.Frame(app_shell, bg="#f3f6fb")
         header.pack(fill=tk.X, pady=(0, 12))
+        self.header = header
 
         brand_frame = tk.Frame(header, bg="#f3f6fb")
         brand_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -3616,6 +3960,9 @@ class MermaidDiagramTool:
         )
         toolbar.pack(fill=tk.X, pady=(0, 12))
         self.toolbar = toolbar
+        self.toolbar_groups = []
+        self._toolbar_layout_scheduled = False
+        self.toolbar.bind("<Configure>", self.on_toolbar_configure)
 
         file_tools = self.create_control_group(toolbar, "Diagram")
         mode_tools = self.create_control_group(toolbar, "Edit")
@@ -3634,22 +3981,11 @@ class MermaidDiagramTool:
         type_combo.pack(side=tk.LEFT, padx=(0, 8), pady=2)
         type_combo.bind("<<ComboboxSelected>>", self.on_diagram_type_changed)
 
-        self.new_button = tk.Button(file_tools, text="New", command=self.new_diagram, width=7)
-        self.new_button.pack(side=tk.LEFT, padx=3, pady=2)
-        self.open_button = tk.Button(file_tools, text="Open", command=self.open_mermaid, width=7)
-        self.open_button.pack(side=tk.LEFT, padx=3, pady=2)
-        self.save_button = tk.Button(file_tools, text="Save", command=self.save_mermaid, width=7)
-        self.save_button.pack(side=tk.LEFT, padx=3, pady=2)
-        self.export_png_button = tk.Button(file_tools, text="PNG", command=self.export_png, width=7)
-        self.export_png_button.pack(side=tk.LEFT, padx=3, pady=2)
-        self.export_svg_button = tk.Button(file_tools, text="SVG", command=self.export_svg, width=7)
-        self.export_svg_button.pack(side=tk.LEFT, padx=3, pady=2)
-
         self.add_button = tk.Button(mode_tools, text="Add Class", command=self.add_primary_element, width=11)
         self.add_button.pack(side=tk.LEFT, padx=3, pady=2)
         self.delete_button = tk.Button(mode_tools, text="Delete", command=self.delete_selected, width=10)
         self.delete_button.pack(side=tk.LEFT, padx=3, pady=2)
-        self.layout_button = tk.Button(mode_tools, text="Layout", command=self.apply_hierarchical_layout, width=9)
+        self.layout_button = tk.Button(mode_tools, text="Layout", command=self.apply_auto_layout, width=9)
         self.layout_button.pack(side=tk.LEFT, padx=3, pady=2)
 
         self.connection_label = tk.Label(
@@ -3677,17 +4013,19 @@ class MermaidDiagramTool:
         self.rel_button = tk.Button(connector_tools, text="Draw", command=self.toggle_relationship_mode, width=9)
         self.rel_button.pack(side=tk.LEFT, padx=3, pady=2)
 
+        view_zoom_row = tk.Frame(zoom_tools, bg="#f7f9fc")
+        view_zoom_row.pack(anchor=tk.W)
         tk.Label(
-            zoom_tools,
+            view_zoom_row,
             text="Zoom",
             bg="#f7f9fc",
             fg="#243447",
             font=("Segoe UI", 9, "bold"),
         ).pack(side=tk.LEFT, padx=(0, 6), pady=2)
-        self.zoom_out_button = tk.Button(zoom_tools, text="-", command=self.zoom_out, width=3)
+        self.zoom_out_button = tk.Button(view_zoom_row, text="-", command=self.zoom_out, width=3)
         self.zoom_out_button.pack(side=tk.LEFT, padx=2, pady=2)
         self.zoom_label = tk.Label(
-            zoom_tools,
+            view_zoom_row,
             text="100%",
             bg="#f7f9fc",
             width=4,
@@ -3695,14 +4033,14 @@ class MermaidDiagramTool:
             font=("Segoe UI Semibold", 9),
         )
         self.zoom_label.pack(side=tk.LEFT, padx=2, pady=2)
-        self.zoom_in_button = tk.Button(zoom_tools, text="+", command=self.zoom_in, width=3)
+        self.zoom_in_button = tk.Button(view_zoom_row, text="+", command=self.zoom_in, width=3)
         self.zoom_in_button.pack(side=tk.LEFT, padx=2, pady=2)
-        self.zoom_reset_button = tk.Button(zoom_tools, text="1:1", command=self.zoom_reset, width=4)
+        self.zoom_reset_button = tk.Button(view_zoom_row, text="1:1", command=self.zoom_reset, width=4)
         self.zoom_reset_button.pack(side=tk.LEFT, padx=(2, 8), pady=2)
 
         self.show_grid = tk.BooleanVar(value=False)
         self.grid_check = tk.Checkbutton(
-            zoom_tools,
+            view_zoom_row,
             text="Grid",
             variable=self.show_grid,
             command=self.toggle_grid,
@@ -3723,6 +4061,7 @@ class MermaidDiagramTool:
             pady=10,
         )
         summary_card.pack(fill=tk.X, pady=(0, 12))
+        self.summary_card = summary_card
         self.summary_label = tk.Label(
             summary_card,
             text="",
@@ -3756,6 +4095,7 @@ class MermaidDiagramTool:
         )
         palette_shell.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 12))
         palette_shell.pack_propagate(False)
+        self.palette_shell = palette_shell
         tk.Label(
             palette_shell,
             text="Tools",
@@ -3779,6 +4119,7 @@ class MermaidDiagramTool:
 
         center_column = tk.Frame(content_frame, bg="#f3f6fb")
         center_column.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.center_column = center_column
 
         canvas_card = tk.Frame(
             center_column,
@@ -3846,6 +4187,7 @@ class MermaidDiagramTool:
         )
         preview_panel.pack(side=tk.RIGHT, fill=tk.Y, padx=(12, 0))
         preview_panel.pack_propagate(False)
+        self.preview_panel = preview_panel
 
         tk.Label(
             preview_panel,
@@ -3866,9 +4208,11 @@ class MermaidDiagramTool:
 
         action_row = tk.Frame(preview_panel, bg="#ffffff")
         action_row.pack(fill=tk.X, padx=14, pady=(0, 10))
+        self.render_code_button = tk.Button(action_row, text="Render Code", command=self.render_code_preview, width=11)
+        self.render_code_button.pack(side=tk.LEFT, padx=(0, 6))
         self.copy_code_button = tk.Button(action_row, text="Copy Code", command=self.copy_mermaid_code, width=11)
         self.copy_code_button.pack(side=tk.LEFT, padx=(0, 6))
-        self.refresh_code_button = tk.Button(action_row, text="Refresh", command=self.refresh_code_preview, width=9)
+        self.refresh_code_button = tk.Button(action_row, text="Sync", command=lambda: self.refresh_code_preview(force=True), width=9)
         self.refresh_code_button.pack(side=tk.LEFT)
 
         self.code_meta_label = tk.Label(
@@ -3889,7 +4233,6 @@ class MermaidDiagramTool:
         self.code_preview = tk.Text(
             code_frame,
             wrap=tk.NONE,
-            state=tk.DISABLED,
             bg="#0f1724",
             fg="#dfe8f3",
             insertbackground="#dfe8f3",
@@ -3902,8 +4245,11 @@ class MermaidDiagramTool:
             xscrollcommand=code_x_scroll.set,
         )
         self.code_preview.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.code_preview.bind("<<Modified>>", self.on_code_preview_modified)
         code_scroll.config(command=self.code_preview.yview)
         code_x_scroll.config(command=self.code_preview.xview)
+        self.code_preview_dirty = False
+        self._updating_code_preview = False
 
         samples_panel = tk.Frame(
             preview_panel,
@@ -3931,11 +4277,11 @@ class MermaidDiagramTool:
             justify=tk.LEFT,
         ).pack(anchor=tk.W, pady=(4, 8))
         self.sample_map = {
-            "Class sample": "sample_class_diagram.md",
-            "Flowchart sample": "sample_flowchart.md",
-            "Sequence sample": "sample_sequence_diagram.md",
-            "State sample": "sample_state_diagram.md",
-            "ER sample": "sample_er_diagram.md",
+            "Class sample": os.path.join("samples", "sample_class_diagram.md"),
+            "Flowchart sample": os.path.join("samples", "sample_flowchart.md"),
+            "Sequence sample": os.path.join("samples", "sample_sequence_diagram.md"),
+            "State sample": os.path.join("samples", "sample_state_diagram.md"),
+            "ER sample": os.path.join("samples", "sample_er_diagram.md"),
         }
         sample_picker_row = tk.Frame(samples_panel, bg="#f7f9fc")
         sample_picker_row.pack(fill=tk.X)
@@ -3990,6 +4336,8 @@ class MermaidDiagramTool:
         self.root.focus_set()  # Make sure root can receive key events
         self.current_status_message = "Ready"
         self.apply_button_styles()
+        self.update_panel_toggle_buttons()
+        self.schedule_toolbar_layout()
         self.refresh_ui_feedback()
 
     def create_control_group(self, parent, title):
@@ -4001,7 +4349,7 @@ class MermaidDiagramTool:
             padx=10,
             pady=8,
         )
-        frame.pack(side=tk.LEFT, padx=(0, 10))
+        self.toolbar_groups.append(frame)
         tk.Label(
             frame,
             text=title,
@@ -4012,6 +4360,46 @@ class MermaidDiagramTool:
         body = tk.Frame(frame, bg="#f7f9fc")
         body.pack(anchor=tk.W)
         return body
+
+    def on_toolbar_configure(self, event=None):
+        self.schedule_toolbar_layout()
+
+    def schedule_toolbar_layout(self):
+        if self._toolbar_layout_scheduled or not hasattr(self, "toolbar"):
+            return
+        self._toolbar_layout_scheduled = True
+        self.root.after_idle(self.update_toolbar_layout)
+
+    def update_toolbar_layout(self):
+        self._toolbar_layout_scheduled = False
+        if not getattr(self, "top_controls_visible", True):
+            return
+        if not hasattr(self, "toolbar_groups"):
+            return
+
+        self.toolbar.update_idletasks()
+        available_width = max(320, self.toolbar.winfo_width() - 24)
+        for column in range(len(self.toolbar_groups) + 1):
+            self.toolbar.grid_columnconfigure(column, weight=0)
+        row = 0
+        col = 0
+        used_width = 0
+        for group in self.toolbar_groups:
+            group.update_idletasks()
+            group_width = group.winfo_reqwidth()
+            if col > 0 and used_width + group_width > available_width:
+                row += 1
+                col = 0
+                used_width = 0
+            group.grid(row=row, column=col, padx=(0, 10), pady=(0, 10 if row == 0 else 0), sticky="nw")
+            used_width += group_width + 10
+            col += 1
+
+        for extra_row in range(row + 1, 6):
+            self.toolbar.grid_rowconfigure(extra_row, weight=0)
+        for grid_row in range(row + 1):
+            self.toolbar.grid_rowconfigure(grid_row, weight=0)
+        self.toolbar.grid_columnconfigure(max(col - 1, 0), weight=1)
     
     def create_shape_palette(self):
         """Create the shape palette with visual buttons"""
@@ -4049,9 +4437,6 @@ class MermaidDiagramTool:
 
     def apply_button_styles(self):
         button_specs = [
-            (self.new_button, "subtle"),
-            (self.open_button, "subtle"),
-            (self.save_button, "primary"),
             (self.add_button, "primary"),
             (self.delete_button, "warning"),
             (self.layout_button, "accent"),
@@ -4059,6 +4444,7 @@ class MermaidDiagramTool:
             (self.zoom_out_button, "subtle"),
             (self.zoom_in_button, "subtle"),
             (self.zoom_reset_button, "subtle"),
+            (self.render_code_button, "primary"),
             (self.copy_code_button, "neutral"),
             (self.refresh_code_button, "subtle"),
             (self.sample_load_button, "ghost"),
@@ -4092,8 +4478,32 @@ class MermaidDiagramTool:
             cursor="hand2",
         )
 
-    def refresh_code_preview(self):
+    def set_code_preview_text(self, preview_text, mark_clean=True):
+        self._updating_code_preview = True
+        self.code_preview.edit_modified(False)
+        self.code_preview.delete("1.0", tk.END)
+        self.code_preview.insert("1.0", preview_text)
+        self.code_preview.edit_modified(False)
+        self._updating_code_preview = False
+        self.code_preview_dirty = not mark_clean
+
+    def on_code_preview_modified(self, event=None):
+        if self._updating_code_preview:
+            self.code_preview.edit_modified(False)
+            return
+        self.code_preview_dirty = True
+        self.code_preview.edit_modified(False)
+        if hasattr(self, "code_meta_label"):
+            current_text = self.code_preview.get("1.0", tk.END).rstrip("\n")
+            line_count = len(current_text.splitlines()) if current_text else 0
+            self.code_meta_label.config(
+                text=f"{self.get_diagram_display_name()} · {line_count} line{'s' if line_count != 1 else ''} · edited"
+            )
+
+    def refresh_code_preview(self, force=False):
         if not hasattr(self, "code_preview"):
+            return
+        if self.code_preview_dirty and not force:
             return
 
         try:
@@ -4109,24 +4519,114 @@ class MermaidDiagramTool:
             if hasattr(self, "code_meta_label"):
                 self.code_meta_label.config(text="Preview unavailable")
 
-        self.code_preview.config(state=tk.NORMAL)
-        self.code_preview.delete("1.0", tk.END)
-        self.code_preview.insert("1.0", preview_text)
-        self.code_preview.config(state=tk.DISABLED)
+        self.set_code_preview_text(preview_text, mark_clean=True)
+
+    def update_panel_toggle_buttons(self):
+        if hasattr(self, "toggle_tools_button"):
+            self.toggle_tools_button.config(
+                text="Hide Tools" if self.palette_panel_visible else "Show Tools",
+                width=11,
+            )
+        if hasattr(self, "toggle_code_button"):
+            self.toggle_code_button.config(
+                text="Hide Code" if self.preview_panel_visible else "Show Code",
+                width=11,
+            )
+        if hasattr(self, "focus_canvas_button"):
+            is_focused = not self.palette_panel_visible and not self.preview_panel_visible
+            self.focus_canvas_button.config(
+                text="Restore Panels" if is_focused else "Canvas Focus",
+                width=12,
+            )
+
+    def toggle_top_controls(self):
+        self.top_controls_visible = not self.top_controls_visible
+        if self.top_controls_visible:
+            self.toolbar.pack(fill=tk.X, pady=(0, 12), after=self.header)
+            self.summary_card.pack(fill=tk.X, pady=(0, 12), after=self.toolbar)
+            self.schedule_toolbar_layout()
+        else:
+            self.toolbar.pack_forget()
+            self.summary_card.pack_forget()
+        self.update_panel_toggle_buttons()
+
+    def toggle_palette_panel(self):
+        self.palette_panel_visible = not self.palette_panel_visible
+        if self.palette_panel_visible:
+            self.palette_shell.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 12), before=self.center_column)
+        else:
+            self.palette_shell.pack_forget()
+        self.update_panel_toggle_buttons()
+
+    def toggle_preview_panel(self):
+        self.preview_panel_visible = not self.preview_panel_visible
+        if self.preview_panel_visible:
+            self.preview_panel.pack(side=tk.RIGHT, fill=tk.Y, padx=(12, 0))
+        else:
+            self.preview_panel.pack_forget()
+        self.update_panel_toggle_buttons()
+
+    def toggle_canvas_focus_mode(self):
+        should_focus = self.palette_panel_visible or self.preview_panel_visible
+        self.palette_panel_visible = not should_focus
+        self.preview_panel_visible = not should_focus
+
+        if self.palette_panel_visible:
+            self.palette_shell.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 12), before=self.center_column)
+        else:
+            self.palette_shell.pack_forget()
+
+        if self.preview_panel_visible:
+            self.preview_panel.pack(side=tk.RIGHT, fill=tk.Y, padx=(12, 0))
+        else:
+            self.preview_panel.pack_forget()
+
+        self.update_panel_toggle_buttons()
 
     def copy_mermaid_code(self):
-        try:
-            mermaid_code = self.generate_mermaid()
-        except Exception as exc:
-            messagebox.showerror("Copy Mermaid Code", f"Could not generate Mermaid code: {exc}")
-            return
+        mermaid_code = self.code_preview.get("1.0", tk.END).rstrip("\n")
+        if not mermaid_code:
+            try:
+                mermaid_code = self.generate_mermaid()
+            except Exception as exc:
+                messagebox.showerror("Copy Mermaid Code", f"Could not generate Mermaid code: {exc}")
+                return
 
         self.root.clipboard_clear()
         self.root.clipboard_append(mermaid_code)
         self.update_status("Copied Mermaid code to clipboard")
 
+    def render_code_preview(self):
+        code_text = self.code_preview.get("1.0", tk.END).strip()
+        if not code_text:
+            messagebox.showinfo("Render Mermaid", "Enter Mermaid code in the editor first.")
+            return
+
+        if self.has_unsaved_changes:
+            response = messagebox.askyesnocancel(
+                "Unsaved Diagram Changes",
+                "Rendering code will replace the current visual diagram. Save your current changes first?"
+            )
+            if response is None:
+                return
+            if response:
+                self.save_mermaid()
+                if self.has_unsaved_changes:
+                    return
+
+        try:
+            self.set_zoom_level(1.0)
+            self.parse_mermaid(code_text, apply_auto_layout=True)
+            self.current_file = None
+            self.mark_as_changed()
+            self.code_preview_dirty = False
+            self.refresh_code_preview(force=True)
+            self.update_status("Rendered Mermaid code from editor")
+        except Exception as exc:
+            messagebox.showerror("Render Mermaid", f"Could not render Mermaid code:\n{exc}")
+
     def load_sample_diagram(self, sample_file):
-        sample_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), sample_file)
+        sample_path = os.path.join(self.runtime_base_dir, sample_file)
         if not os.path.exists(sample_path):
             messagebox.showerror("Sample Diagram", f"Could not find sample file:\n{sample_file}")
             return
@@ -4442,21 +4942,15 @@ class MermaidDiagramTool:
         x = 200 + (len(self.flowchart_nodes) % 3) * 150
         y = 200 + (len(self.flowchart_nodes) // 3) * 120
         
-        node = FlowchartNode(self.canvas, x, y, f"node{len(self.flowchart_nodes) + 1}", 
+        node = FlowchartNode(self.canvas, x, y, f"node{len(self.flowchart_nodes) + 1}",
                             f"Node {len(self.flowchart_nodes) + 1}", shape_type, self)
         self.flowchart_nodes.append(node)
-        
-        # Auto-select the new node
-        for n in self.flowchart_nodes:
-            n.deselect()
-        node.select()
-        self.selected_node = node
-        
+        self.select_new_item(node, f"Added {shape_type} node")
+
         self.update_scroll_region()
         self.ensure_grid_behind()
         self.mark_as_changed()
-        self.update_status(f"Added {shape_type} node")
-    
+
     def add_sequence_actor(self):
         """Add a sequence diagram actor"""
         if self.diagram_type != "sequenceDiagram":
@@ -4467,10 +4961,10 @@ class MermaidDiagramTool:
         y = 50
         actor = SequenceActor(self.canvas, x, y, f"Actor{len(self.sequence_actors) + 1}", self)
         self.sequence_actors.append(actor)
+        self.select_new_item(actor, "Added actor")
         self.update_scroll_region()
         self.mark_as_changed()
-        self.update_status("Added actor")
-    
+
     def add_state_node(self):
         """Add a state diagram node"""
         if self.diagram_type != "stateDiagram":
@@ -4481,10 +4975,10 @@ class MermaidDiagramTool:
         y = 150 + (len(self.state_nodes) // 3) * 120
         state = StateNode(self.canvas, x, y, f"State{len(self.state_nodes) + 1}", self)
         self.state_nodes.append(state)
+        self.select_new_item(state, "Added state")
         self.update_scroll_region()
         self.mark_as_changed()
-        self.update_status("Added state")
-    
+
     def add_er_entity(self):
         """Add an ER diagram entity"""
         if self.diagram_type != "erDiagram":
@@ -4495,9 +4989,9 @@ class MermaidDiagramTool:
         y = 150 + (len(self.er_entities) // 3) * 150
         entity = EREntity(self.canvas, x, y, f"Entity{len(self.er_entities) + 1}", self)
         self.er_entities.append(entity)
+        self.select_new_item(entity, "Added entity")
         self.update_scroll_region()
         self.mark_as_changed()
-        self.update_status("Added entity")
         
     def get_diagram_display_name(self):
         names = {
@@ -4573,25 +5067,34 @@ class MermaidDiagramTool:
         if self.relationship_mode:
             connector_type = self.rel_type_var.get()
             return f"Connector mode: pick source, then target, to create a {connector_type} {self.get_connector_name()}."
-        return (
-            f"Right-click empty space to add a {self.get_primary_element_name()}. Drag to reposition. Delete removes the current selection."
-        )
+        selection_description = self.get_selected_visual_description()
+        if selection_description:
+            return f"Selected: {selection_description}. Double-click to edit. Delete removes the current selection."
+        return f"Right-click empty space to add a {self.get_primary_element_name()}. Drag to reposition. Delete removes the current selection."
 
     def refresh_ui_feedback(self):
+        selection_description = self.get_selected_visual_description()
         if hasattr(self, 'summary_label'):
+            summary_text = (
+                f"{self.get_diagram_display_name()}  |  "
+                f"{len(self.get_active_node_collection())} {self.get_primary_element_plural()}  |  "
+                f"{len(self.get_active_connection_collection())} {self.get_short_connector_name()}  |  "
+                f"Zoom {int(self.zoom_level * 100)}%"
+            )
+            if selection_description:
+                summary_text += f"  |  Selected {selection_description}"
             self.summary_label.config(
-                text=(
-                    f"{self.get_diagram_display_name()}  |  "
-                    f"{len(self.get_active_node_collection())} {self.get_primary_element_plural()}  |  "
-                    f"{len(self.get_active_connection_collection())} {self.get_short_connector_name()}  |  "
-                    f"Zoom {int(self.zoom_level * 100)}%"
-                )
+                text=summary_text
             )
         if hasattr(self, 'mode_hint_label'):
             self.mode_hint_label.config(text=self.get_mode_hint_text())
         if hasattr(self, 'info_banner'):
             shortcut_hint = "Esc cancels connector mode" if self.relationship_mode else "Right-click empty space to add an element quickly"
-            self.info_banner.config(text=f"{self.current_status_message}   |   {shortcut_hint}")
+            self.info_banner.config(
+                text=f"{self.current_status_message}   |   {shortcut_hint}",
+                bg="#eef7ef" if self.relationship_mode else "#eef5ff",
+                fg="#244b34" if self.relationship_mode else "#1e3a5f",
+            )
         if hasattr(self, 'document_label'):
             current_name = os.path.basename(self.current_file) if self.current_file else "Untitled diagram"
             self.document_label.config(text=current_name)
@@ -4651,6 +5154,27 @@ class MermaidDiagramTool:
     def get_all_connections(self):
         return self.relationships + self.flowchart_connections + self.sequence_messages + self.state_transitions + self.er_relationships
 
+    def get_selected_visual_description(self):
+        if self.selected_class:
+            return f"class {self.selected_class.name}"
+        if self.selected_node:
+            return f"node {self.selected_node.node_id}"
+        if self.selected_item:
+            if hasattr(self.selected_item, "name"):
+                return f"{self.get_primary_element_name()} {self.selected_item.name}"
+            if hasattr(self.selected_item, "node_id"):
+                return f"{self.get_primary_element_name()} {self.selected_item.node_id}"
+        for connection in self.get_all_connections():
+            if getattr(connection, "selected", False):
+                if hasattr(connection, "rel_type"):
+                    return f"{connection.rel_type} {self.get_connector_name()}"
+                if hasattr(connection, "conn_type"):
+                    return f"{connection.conn_type} {self.get_connector_name()}"
+                if hasattr(connection, "msg_type"):
+                    return f"{connection.msg_type} {self.get_connector_name()}"
+                return self.get_connector_name()
+        return None
+
     def deselect_all_visuals(self):
         for class_box in self.classes:
             class_box.deselect()
@@ -4669,6 +5193,22 @@ class MermaidDiagramTool:
         self.selected_node = None
         self.selected_item = None
 
+    def select_new_item(self, item, status_message=None):
+        self.deselect_all_visuals()
+        if hasattr(item, "select"):
+            item.select()
+        if isinstance(item, ClassBox):
+            self.selected_class = item
+        elif isinstance(item, FlowchartNode):
+            self.selected_node = item
+        else:
+            self.selected_item = item
+        self.canvas.focus_set()
+        if status_message:
+            self.update_status(status_message)
+        else:
+            self.refresh_ui_feedback()
+
     def find_active_node_at(self, canvas_x, canvas_y):
         for node in self.get_active_node_collection():
             zoom_level = self.zoom_level if hasattr(self, 'zoom_level') else 1.0
@@ -4681,6 +5221,17 @@ class MermaidDiagramTool:
             if node.x <= canvas_x <= node.x + width and node.y <= canvas_y <= node.y + height:
                 return node
         return None
+
+    def is_canvas_position_empty(self, canvas_x, canvas_y):
+        return self.find_active_node_at(canvas_x, canvas_y) is None
+
+    def begin_canvas_pan(self, event):
+        self.is_panning = True
+        self.pan_start_x = event.x
+        self.pan_start_y = event.y
+        self.canvas.config(cursor="fleur")
+        self.deselect_all_visuals()
+        self.update_status("Pan mode - drag to move diagram")
 
     def create_mode_connection(self, source_node, target_node):
         connection_type = self.rel_type_var.get()
@@ -4736,6 +5287,8 @@ class MermaidDiagramTool:
             rel.update_position()
         for rel in self.sequence_messages:
             rel.update_position()
+        for note in self.sequence_notes:
+            note.update_position()
         for rel in self.state_transitions:
             rel.update_position()
         for rel in self.er_relationships:
@@ -5016,13 +5569,8 @@ class MermaidDiagramTool:
         y = 150 + (len(self.classes) // 4) * 200
         class_box = ClassBox(self.canvas, x, y, f"Class{len(self.classes) + 1}", self)
         self.classes.append(class_box)
-        
-        # Auto-select the new class
-        for cls in self.classes:
-            cls.deselect()
-        class_box.select()
-        self.selected_class = class_box
-        
+        self.select_new_item(class_box, f"Added class {class_box.name}")
+
         self.update_scroll_region()
         self.ensure_grid_behind()
         self.mark_as_changed()
@@ -5034,16 +5582,11 @@ class MermaidDiagramTool:
 
         x = 150 + (len(self.flowchart_nodes) % 4) * 200
         y = 150 + (len(self.flowchart_nodes) // 4) * 150
-        node = FlowchartNode(self.canvas, x, y, f"node{len(self.flowchart_nodes) + 1}", 
+        node = FlowchartNode(self.canvas, x, y, f"node{len(self.flowchart_nodes) + 1}",
                             f"Node {len(self.flowchart_nodes) + 1}", "rectangle", self)
         self.flowchart_nodes.append(node)
-        
-        # Auto-select the new node
-        for n in self.flowchart_nodes:
-            n.deselect()
-        node.select()
-        self.selected_node = node
-        
+        self.select_new_item(node, f"Added node {node.node_id}")
+
         self.update_scroll_region()
         self.ensure_grid_behind()
         self.mark_as_changed()
@@ -5057,35 +5600,30 @@ class MermaidDiagramTool:
             self.create_flowchart_palette()
             rel_values = ["arrow", "line", "dotted", "thick"]
             rel_label = "Flow:"
-            rel_text = "Add Link"
-            self.layout_button.config(state=tk.DISABLED)
+            self.layout_button.config(state=tk.NORMAL)
         elif self.diagram_type == "sequenceDiagram":
             self.add_button.config(text="Add Actor")
             self.create_sequence_palette()
             rel_values = ["sync", "async", "return"]
             rel_label = "Message:"
-            rel_text = "Add Message"
-            self.layout_button.config(state=tk.DISABLED)
+            self.layout_button.config(state=tk.NORMAL)
         elif self.diagram_type == "stateDiagram":
             self.add_button.config(text="Add State")
             self.create_state_palette()
             rel_values = ["transition"]
             rel_label = "State:"
-            rel_text = "Add Transition"
-            self.layout_button.config(state=tk.DISABLED)
+            self.layout_button.config(state=tk.NORMAL)
         elif self.diagram_type == "erDiagram":
             self.add_button.config(text="Add Entity")
             self.create_er_palette()
             rel_values = ["one-to-one", "one-to-many", "many-to-many"]
             rel_label = "ER:"
-            rel_text = "Add Relation"
-            self.layout_button.config(state=tk.DISABLED)
+            self.layout_button.config(state=tk.NORMAL)
         else:
             self.add_button.config(text="Add Class")
             self.create_uml_palette()
             rel_values = ["association", "inheritance", "composition", "aggregation", "dependency", "realization"]
             rel_label = "Class:"
-            rel_text = "Add Relationship"
             self.layout_button.config(state=tk.NORMAL)
 
         if not self.shape_palette.winfo_manager():
@@ -5173,114 +5711,18 @@ class MermaidDiagramTool:
             if clicked_class:
                 # Clicked on a class - definitely not panning
                 self.is_panning = False
-                
-                # Deselect all classes first
-                for class_box in self.classes:
-                    class_box.deselect()
-                
-                # Deselect all relationships
-                for rel in self.relationships:
-                    rel.deselect()
-                
-                # Select the clicked class
-                clicked_class.select()
-                self.selected_class = clicked_class
-                self.update_status(f"Selected class: {clicked_class.name}")
-                
+                self.select_new_item(clicked_class, f"Selected class: {clicked_class.name}")
+
             elif clicked_relationship:
                 # Clicked on a relationship - select it
                 self.is_panning = False
-                
-                # Deselect all classes
-                for class_box in self.classes:
-                    class_box.deselect()
-                
-                # Deselect all other relationships
-                for rel in self.relationships:
-                    rel.deselect()
-                
-                # Select the clicked relationship
+                self.deselect_all_visuals()
                 clicked_relationship.select()
-                self.selected_class = None
                 self.update_status(f"Selected {clicked_relationship.rel_type} relationship - click a relationship type in the palette to change it")
-                
+
             else:
-                # Clicked on empty space - check if really empty
-                # Convert event coordinates to canvas coordinates
-                canvas_x = self.canvas.canvasx(event.x)
-                canvas_y = self.canvas.canvasy(event.y)
-                
-                # Double-check no element at this position (using canvas coordinates)
-                really_empty = True
-                
-                # Check classes
-                for class_box in self.classes:
-                    if (class_box.x <= canvas_x <= class_box.x + class_box.width and
-                        class_box.y <= canvas_y <= class_box.y + class_box.height):
-                        really_empty = False
-                        break
-                
-                # Check flowchart nodes
-                if really_empty:
-                    for node in self.flowchart_nodes:
-                        if (node.x <= canvas_x <= node.x + node.width and
-                            node.y <= canvas_y <= node.y + node.height):
-                            really_empty = False
-                            break
-                
-                # Check sequence actors
-                if really_empty:
-                    for actor in self.sequence_actors:
-                        if (actor.x <= canvas_x <= actor.x + actor.width and
-                            actor.y <= canvas_y <= actor.y + actor.height):
-                            really_empty = False
-                            break
-                
-                # Check state nodes
-                if really_empty:
-                    for state in self.state_nodes:
-                        if (state.x <= canvas_x <= state.x + state.width and
-                            state.y <= canvas_y <= state.y + state.height):
-                            really_empty = False
-                            break
-                
-                # Check ER entities
-                if really_empty:
-                    for entity in self.er_entities:
-                        if (entity.x <= canvas_x <= entity.x + entity.width and
-                            entity.y <= canvas_y <= entity.y + entity.height):
-                            really_empty = False
-                            break
-                
-                if really_empty:
-                    # Start panning - store initial position
-                    self.is_panning = True
-                    self.pan_start_x = event.x
-                    self.pan_start_y = event.y
-                    
-                    # Change cursor to indicate panning mode
-                    self.canvas.config(cursor="fleur")  # Four-way arrow cursor
-                    
-                    # Deselect all elements
-                    for class_box in self.classes:
-                        class_box.deselect()
-                    for node in self.flowchart_nodes:
-                        node.deselect()
-                    for actor in self.sequence_actors:
-                        actor.deselect()
-                    for state in self.state_nodes:
-                        state.deselect()
-                    for entity in self.er_entities:
-                        entity.deselect()
-                    
-                    # Deselect all relationships
-                    for rel in self.relationships:
-                        rel.deselect()
-                    
-                    self.selected_class = None
-                    self.selected_node = None
-                    self.selected_item = None
-                    self.update_status("Pan mode - drag to move diagram")
+                if self.is_canvas_position_empty(canvas_x, canvas_y):
+                    self.begin_canvas_pan(event)
                 else:
                     self.is_panning = False
     
@@ -5340,19 +5782,7 @@ class MermaidDiagramTool:
         canvas_x = self.canvas.canvasx(event.x)
         canvas_y = self.canvas.canvasy(event.y)
         
-        # Check if mouse is over a class
-        over_class = False
-        for class_box in self.classes:
-            if (class_box.x <= canvas_x <= class_box.x + class_box.width and
-                class_box.y <= canvas_y <= class_box.y + class_box.height):
-                over_class = True
-                break
-        
-        # Set cursor based on what we're hovering over
-        if over_class:
-            self.canvas.config(cursor="hand2")  # Hand cursor over classes
-        else:
-            self.canvas.config(cursor="")  # Default cursor over empty space
+        self.canvas.config(cursor="hand2" if not self.is_canvas_position_empty(canvas_x, canvas_y) else "")
     
     def canvas_right_click(self, event):
         """Handle right-click quick-create for the active diagram type."""
@@ -5373,13 +5803,8 @@ class MermaidDiagramTool:
 
         class_box = ClassBox(self.canvas, x, y, f"Class{len(self.classes) + 1}", self)
         self.classes.append(class_box)
-        
-        # Auto-select the new class
-        for cls in self.classes:
-            cls.deselect()
-        class_box.select()
-        self.selected_class = class_box
-        
+        self.select_new_item(class_box, f"Added class {class_box.name}")
+
         self.update_scroll_region()
         self.ensure_grid_behind()
         self.mark_as_changed()
@@ -5388,28 +5813,25 @@ class MermaidDiagramTool:
         if self.diagram_type == "flowchart":
             node = FlowchartNode(self.canvas, x, y, f"node{len(self.flowchart_nodes) + 1}", f"Node {len(self.flowchart_nodes) + 1}", "rectangle", self)
             self.flowchart_nodes.append(node)
-            self.selected_node = node
-            node.select()
+            self.select_new_item(node, f"Added node {node.node_id}")
         elif self.diagram_type == "sequenceDiagram":
             actor = SequenceActor(self.canvas, x, y, f"Actor{len(self.sequence_actors) + 1}", self)
             self.sequence_actors.append(actor)
-            self.selected_item = actor
-            actor.select()
+            self.select_new_item(actor, "Added actor")
         elif self.diagram_type == "stateDiagram":
             state = StateNode(self.canvas, x, y, f"State{len(self.state_nodes) + 1}", self)
             self.state_nodes.append(state)
-            self.selected_item = state
-            state.select()
+            self.select_new_item(state, "Added state")
         elif self.diagram_type == "erDiagram":
             entity = EREntity(self.canvas, x, y, f"Entity{len(self.er_entities) + 1}", self)
             self.er_entities.append(entity)
-            self.selected_item = entity
-            entity.select()
+            self.select_new_item(entity, "Added entity")
         else:
             self.add_class_at_position(x, y)
             return
 
         self.update_scroll_region()
+        self.ensure_grid_behind()
         self.mark_as_changed()
         
     def delete_selected(self):
@@ -5539,6 +5961,7 @@ class MermaidDiagramTool:
             self.deselect_all_visuals()
             self.update_scroll_region()
             self.ensure_grid_behind()
+            self.update_status("Deleted selection")
             
     def toggle_relationship_mode(self, force_off=False):
         if self.relationship_mode or force_off:
@@ -6220,14 +6643,21 @@ class MermaidDiagramTool:
         self.classes.clear()
         self.flowchart_nodes.clear()
         self.flowchart_connections.clear()
+        self.flowchart_direction = "TD"
+        self.flowchart_preserved_lines.clear()
         self.sequence_actors.clear()
         self.sequence_messages.clear()
+        self.sequence_notes.clear()
         self.sequence_directives.clear()
+        self.sequence_export_rows.clear()
         self.state_nodes.clear()
         self.state_transitions.clear()
+        self.state_preserved_lines.clear()
         self.er_entities.clear()
         self.er_relationships.clear()
         self.er_direction = None
+        self.er_preserved_lines.clear()
+        self.class_preserved_lines.clear()
         self.canvas_svg_exports.clear()
         self.relationships.clear()
         self.selected_class = None
@@ -6282,26 +6712,77 @@ class MermaidDiagramTool:
         self.update_diagram_type_ui()
 
         if diagram_type == "flowchart":
-            return self.parse_flowchart(mermaid_code)
+            return self.parse_flowchart(mermaid_code, apply_auto_layout)
         if diagram_type == "sequenceDiagram":
-            return self.parse_sequence_diagram(mermaid_code)
+            return self.parse_sequence_diagram(mermaid_code, apply_auto_layout)
         if diagram_type == "stateDiagram":
-            return self.parse_state_diagram(mermaid_code)
+            return self.parse_state_diagram(mermaid_code, apply_auto_layout)
         if diagram_type == "erDiagram":
-            return self.parse_er_diagram(mermaid_code)
+            return self.parse_er_diagram(mermaid_code, apply_auto_layout)
         return self.parse_class_diagram(mermaid_code, apply_auto_layout)
-    
-    def parse_flowchart(self, mermaid_code):
+
+    def parse_flowchart_node_reference(self, reference, nodes_data):
+        match = FLOWCHART_NODE_REFERENCE_RE.match(reference or "")
+        if not match:
+            return None
+        node_id, circle_text, rounded_text, rect_text, diamond_text = match.groups()
+        if circle_text is not None:
+            nodes_data[node_id] = {'text': circle_text, 'shape': 'circle'}
+        elif rounded_text is not None:
+            nodes_data[node_id] = {'text': rounded_text, 'shape': 'rounded'}
+        elif rect_text is not None:
+            nodes_data[node_id] = {'text': rect_text, 'shape': 'rectangle'}
+        elif diamond_text is not None:
+            nodes_data[node_id] = {'text': diamond_text, 'shape': 'diamond'}
+        elif node_id not in nodes_data:
+            nodes_data[node_id] = {'text': node_id, 'shape': 'rectangle'}
+        return node_id
+
+    def parse_flowchart(self, mermaid_code, apply_auto_layout=True):
         """Parse flowchart code."""
         lines = [line.strip() for line in mermaid_code.split('\n') if line.strip()]
         
         nodes_data = {}
         connections = []
+        self.flowchart_direction = "TD"
+        self.flowchart_preserved_lines = []
+        in_subgraph = False
         
         for line in lines:
             if line.startswith('flowchart') or line.startswith('graph'):
+                parts = line.split()
+                if len(parts) >= 2:
+                    self.flowchart_direction = parts[1].upper()
+                continue
+            if line.startswith("%%"):
+                self.flowchart_preserved_lines.append(line)
+                continue
+            if line.startswith("subgraph"):
+                in_subgraph = True
+                self.flowchart_preserved_lines.append(line)
+                continue
+            if in_subgraph:
+                self.flowchart_preserved_lines.append(line)
+                if line.lower() == "end":
+                    in_subgraph = False
                 continue
             
+            # Parse connections: A --> B or A -->|label| B, including inline node refs
+            conn_match = re.match(r'(.+?)\s*(-->|---|-\.->|==>)\s*(?:\|([^|]+)\|\s*)?(.+)', line)
+            if conn_match:
+                from_ref, conn_type, label, to_ref = conn_match.groups()
+                from_node = self.parse_flowchart_node_reference(from_ref.strip(), nodes_data)
+                to_node = self.parse_flowchart_node_reference(to_ref.strip(), nodes_data)
+                if from_node and to_node:
+                    flow_type_map = {
+                        "-->": "arrow",
+                        "---": "line",
+                        "-.->": "dotted",
+                        "==>": "thick"
+                    }
+                    connections.append((from_node, to_node, flow_type_map.get(conn_type, "arrow"), (label or "").strip()))
+                    continue
+
             circle_match = re.match(r'(\w+)\(\((.+)\)\)', line)
             if circle_match:
                 node_id, text = circle_match.groups()
@@ -6319,24 +6800,8 @@ class MermaidDiagramTool:
                     shape = "diamond"
                 nodes_data[node_id] = {'text': text, 'shape': shape}
                 continue
-            
-            # Parse connections: A --> B or A --- B, optionally with a label
-            conn_match = re.match(r'(\w+)\s*(-->|---|-\.->|==>)(?:\|([^|]+)\|)?\s*(\w+)', line)
-            if conn_match:
-                from_node, conn_type, label, to_node = conn_match.groups()
-                flow_type_map = {
-                    "-->": "arrow",
-                    "---": "line",
-                    "-.->": "dotted",
-                    "==>": "thick"
-                }
-                connections.append((from_node, to_node, flow_type_map.get(conn_type, "arrow"), label or ""))
-                # Ensure nodes exist
-                if from_node not in nodes_data:
-                    nodes_data[from_node] = {'text': from_node, 'shape': 'rectangle'}
-                if to_node not in nodes_data:
-                    nodes_data[to_node] = {'text': to_node, 'shape': 'rectangle'}
-        
+            self.flowchart_preserved_lines.append(line)
+
         # Create nodes
         x, y = 150, 150
         for i, (node_id, data) in enumerate(nodes_data.items()):
@@ -6353,18 +6818,62 @@ class MermaidDiagramTool:
                 self.flowchart_connections.append(
                     FlowchartConnection(self.canvas, node_lookup[from_node], node_lookup[to_node], conn_type, label, self)
                 )
-        
-        self.update_scroll_region()
+
+        if apply_auto_layout:
+            self.apply_auto_layout()
+        else:
+            self.update_scroll_region()
         self.update_status(f"Loaded flowchart with {len(self.flowchart_nodes)} nodes")
 
-    def parse_sequence_diagram(self, mermaid_code):
+    def parse_sequence_diagram(self, mermaid_code, apply_auto_layout=True):
         lines = [line.strip() for line in mermaid_code.split('\n') if line.strip()]
         actor_lookup = {}
         message_rows = []
+        note_rows = []
         pending_directives = []
+        self.sequence_export_rows = []
+        preserved_block = []
+        block_depth = 0
+        block_keywords = ("alt ", "opt ", "loop ", "par ", "critical ", "break ", "rect ")
+
+        def flush_preserved_block():
+            nonlocal preserved_block
+            if preserved_block:
+                self.sequence_export_rows.append({"type": "raw", "lines": preserved_block[:]})
+                preserved_block = []
 
         for line in lines:
             if line.startswith("sequenceDiagram"):
+                continue
+            if line.startswith("%%"):
+                self.sequence_export_rows.append({"type": "raw", "lines": [line]})
+                continue
+            if block_depth > 0:
+                preserved_block.append(line)
+                if line.startswith(block_keywords):
+                    block_depth += 1
+                elif line == "end":
+                    block_depth -= 1
+                    if block_depth <= 0:
+                        flush_preserved_block()
+                continue
+            if line.startswith(block_keywords):
+                preserved_block = [line]
+                block_depth = 1
+                continue
+            note_match = re.match(r'Note\s+(right of|left of|over)\s+(.+?)\s*:\s*(.+)', line)
+            if note_match:
+                placement, actor_text, note_text = note_match.groups()
+                actor_ids = [part.strip() for part in actor_text.split(",") if part.strip()]
+                note_rows.append({
+                    "placement": placement,
+                    "actor_ids": actor_ids,
+                    "text": note_text.strip(),
+                    "row_index": len(message_rows) + len(note_rows),
+                })
+                self.sequence_export_rows.append({"type": "note", "placement": placement, "actor_ids": actor_ids, "text": note_text.strip()})
+                for actor_id in actor_ids:
+                    actor_lookup.setdefault(actor_id, {"name": actor_id, "kind": "participant", "participant_type": None})
                 continue
             participant_match = re.match(r'(participant|actor)\s+([A-Za-z0-9_]+)(@\{.*?\})?(?:\s+as\s+(.+))?$', line)
             if participant_match:
@@ -6415,9 +6924,12 @@ class MermaidDiagramTool:
                     "arrow": arrow,
                     "directives_before": pending_directives[:],
                 })
+                self.sequence_export_rows.append({"type": "message"})
                 pending_directives.clear()
                 actor_lookup.setdefault(source, {"name": source, "kind": "participant", "participant_type": None})
                 actor_lookup.setdefault(target, {"name": target, "kind": "participant", "participant_type": None})
+                continue
+            self.sequence_export_rows.append({"type": "raw", "lines": [line]})
 
         x = 100
         for actor_id, data in actor_lookup.items():
@@ -6430,6 +6942,20 @@ class MermaidDiagramTool:
             x += 180
 
         actor_objects = {getattr(actor, "actor_id", actor.name): actor for actor in self.sequence_actors}
+        self.sequence_notes = []
+        for note_row in note_rows:
+            actors = [actor_objects.get(actor_id) for actor_id in note_row["actor_ids"] if actor_id in actor_objects]
+            if actors:
+                self.sequence_notes.append(
+                    SequenceNote(
+                        self.canvas,
+                        note_row["placement"],
+                        actors,
+                        note_row["text"],
+                        row_index=note_row["row_index"],
+                        tool=self,
+                    )
+                )
         for index, row in enumerate(message_rows):
             source = row["source"]
             target = row["target"]
@@ -6449,35 +6975,58 @@ class MermaidDiagramTool:
                 self.sequence_messages.append(message)
 
         self.sequence_directives = pending_directives[:]
+        flush_preserved_block()
 
-        self.update_scroll_region()
+        if apply_auto_layout:
+            self.apply_auto_layout()
+        else:
+            self.update_scroll_region()
         self.update_status(f"Loaded sequence diagram with {len(self.sequence_actors)} participants")
 
-    def parse_state_diagram(self, mermaid_code):
+    def parse_state_diagram(self, mermaid_code, apply_auto_layout=True):
         lines = [line.strip() for line in mermaid_code.split('\n') if line.strip()]
         state_names = []
         transitions = []
+        self.state_preserved_lines = []
+        start_state_id = "__start__"
+        end_state_id = "__end__"
 
         for line in lines:
             if line.startswith("stateDiagram"):
+                continue
+            if line.startswith("%%") or line.startswith("direction ") or "{" in line or "}" in line:
+                self.state_preserved_lines.append(line)
                 continue
             state_match = re.match(r'state\s+([A-Za-z0-9_]+)', line)
             if state_match:
                 state_names.append(state_match.group(1))
                 continue
-            trans_match = re.match(r'([A-Za-z0-9_]+)\s*-->\s*([A-Za-z0-9_]+)(?:\s*:\s*(.+))?', line)
+            trans_match = re.match(r'(\[\*\]|[A-Za-z0-9_]+)\s*-->\s*(\[\*\]|[A-Za-z0-9_]+)(?:\s*:\s*(.+))?', line)
             if trans_match:
                 source, target, label = trans_match.groups()
+                source = start_state_id if source == "[*]" else source
+                target = end_state_id if target == "[*]" else target
                 transitions.append((source, target, (label or "").strip()))
                 if source not in state_names:
                     state_names.append(source)
                 if target not in state_names:
                     state_names.append(target)
+                continue
+            self.state_preserved_lines.append(line)
 
         x, y = 150, 150
         state_lookup = {}
         for index, state_name in enumerate(state_names):
-            state = StateNode(self.canvas, x, y, state_name, self)
+            state_kind = "normal"
+            display_name = state_name
+            if state_name == start_state_id:
+                state_kind = "start"
+                display_name = "[*]"
+            elif state_name == end_state_id:
+                state_kind = "end"
+                display_name = "[*]"
+            state = StateNode(self.canvas, x, y, display_name, self, state_kind=state_kind)
+            state.state_id = state_name
             self.state_nodes.append(state)
             state_lookup[state_name] = state
             x += 220
@@ -6489,15 +7038,19 @@ class MermaidDiagramTool:
             if source in state_lookup and target in state_lookup:
                 self.state_transitions.append(StateTransition(self.canvas, state_lookup[source], state_lookup[target], label, self))
 
-        self.update_scroll_region()
+        if apply_auto_layout:
+            self.apply_auto_layout()
+        else:
+            self.update_scroll_region()
         self.update_status(f"Loaded state diagram with {len(self.state_nodes)} states")
 
-    def parse_er_diagram(self, mermaid_code):
+    def parse_er_diagram(self, mermaid_code, apply_auto_layout=True):
         lines = [line.rstrip() for line in mermaid_code.split('\n') if line.strip()]
         entity_blocks = {}
         relationships = []
         current_entity = None
         self.er_direction = None
+        self.er_preserved_lines = []
 
         def ensure_entity(reference):
             entity_id, entity_alias = split_er_entity_reference(reference)
@@ -6510,6 +7063,9 @@ class MermaidDiagramTool:
         for raw_line in lines:
             line = raw_line.strip()
             if line.startswith("erDiagram"):
+                continue
+            if line.startswith("%%"):
+                self.er_preserved_lines.append(line)
                 continue
             if line.startswith("direction "):
                 self.er_direction = line.split(" ", 1)[1].strip()
@@ -6552,6 +7108,8 @@ class MermaidDiagramTool:
             standalone_entity = re.match(r'((?:"[^"]+"|[A-Za-z0-9_-]+)(?:\[(?:"[^"]+"|[^\]]+)\])?)$', line)
             if standalone_entity:
                 ensure_entity(standalone_entity.group(1))
+                continue
+            self.er_preserved_lines.append(line)
 
         x, y = 150, 150
         entity_lookup = {}
@@ -6577,7 +7135,10 @@ class MermaidDiagramTool:
                 relationship.identifying = identifying
                 self.er_relationships.append(relationship)
 
-        self.update_scroll_region()
+        if apply_auto_layout:
+            self.apply_auto_layout()
+        else:
+            self.update_scroll_region()
         self.update_status(f"Loaded ER diagram with {len(self.er_entities)} entities")
     
     def parse_class_diagram(self, mermaid_code, apply_auto_layout=True):
@@ -6592,9 +7153,28 @@ class MermaidDiagramTool:
         relationships = []
         notes = {}
         current_class = None
+        self.class_preserved_lines = []
+        namespace_depth = 0
         
         for line in lines:
             if 'classDiagram' in line:
+                continue
+            if line.startswith("%%"):
+                self.class_preserved_lines.append(line)
+                continue
+            if namespace_depth > 0:
+                self.class_preserved_lines.append(line)
+                if "{" in line:
+                    namespace_depth += line.count("{")
+                if "}" in line:
+                    namespace_depth -= line.count("}")
+                continue
+            if line.startswith("namespace "):
+                namespace_depth = max(1, line.count("{"))
+                self.class_preserved_lines.append(line)
+                continue
+            if line.startswith("direction ") or line.startswith("classDef ") or line.startswith("cssClass ") or line.startswith("style ") or line.startswith("click ") or line.startswith("link ") or line.startswith("callback "):
+                self.class_preserved_lines.append(line)
                 continue
             
             # Parse notes
@@ -6715,6 +7295,8 @@ class MermaidDiagramTool:
                         'to_multiplicity': to_mult
                     })
                     break
+            else:
+                self.class_preserved_lines.append(line)
         
         # Create visual classes
         class_positions = self.calculate_class_positions(len(classes_data))
@@ -6786,151 +7368,331 @@ class MermaidDiagramTool:
             positions.append((x, y))
         
         return positions
-    
+
+    def build_class_layout_graphs(self):
+        """Build directed hierarchy and undirected connectivity maps for class layout."""
+        hierarchy_children = {cls: [] for cls in self.classes}
+        hierarchy_parents = {cls: [] for cls in self.classes}
+        all_connections = {cls: set() for cls in self.classes}
+
+        for rel in self.relationships:
+            if rel.rel_type in ["inheritance", "composition", "realization"]:
+                hierarchy_children[rel.to_class].append(rel.from_class)
+                hierarchy_parents[rel.from_class].append(rel.to_class)
+
+            all_connections[rel.from_class].add(rel.to_class)
+            all_connections[rel.to_class].add(rel.from_class)
+
+        return hierarchy_children, hierarchy_parents, all_connections
+
+    def get_class_connected_components(self, connections):
+        """Return connected components for the undirected class graph."""
+        remaining = set(self.classes)
+        components = []
+
+        while remaining:
+            start = remaining.pop()
+            queue = [start]
+            component = []
+            seen = {start}
+
+            while queue:
+                current = queue.pop(0)
+                component.append(current)
+                for neighbor in connections[current]:
+                    if neighbor not in seen:
+                        seen.add(neighbor)
+                        if neighbor in remaining:
+                            remaining.remove(neighbor)
+                        queue.append(neighbor)
+
+            components.append(component)
+
+        components.sort(key=lambda comp: (-len(comp), sorted(cls.name for cls in comp)))
+        return components
+
+    def compute_class_layout_levels(self, hierarchy_children, hierarchy_parents, all_connections):
+        """Assign classes to levels using hierarchy edges first, then graph proximity."""
+        component_map = {}
+        level_map = {}
+        components = self.get_class_connected_components(all_connections)
+
+        for component_index, component in enumerate(components):
+            component_set = set(component)
+            for cls in component:
+                component_map[cls] = component_index
+
+            local_children = {
+                cls: [child for child in hierarchy_children[cls] if child in component_set]
+                for cls in component
+            }
+            local_parents = {
+                cls: [parent for parent in hierarchy_parents[cls] if parent in component_set]
+                for cls in component
+            }
+
+            has_hierarchy = any(local_children[cls] or local_parents[cls] for cls in component)
+
+            if has_hierarchy:
+                local_in_degree = {cls: len(local_parents[cls]) for cls in component}
+                roots = [cls for cls in component if local_in_degree[cls] == 0]
+                if not roots:
+                    roots = [max(component, key=lambda cls: len(all_connections[cls]))]
+
+                queue = roots[:]
+                for root in roots:
+                    level_map[root] = 0
+
+                while queue:
+                    current = queue.pop(0)
+                    current_level = level_map[current]
+                    for child in local_children[current]:
+                        next_level = current_level + 1
+                        if next_level > level_map.get(child, -1):
+                            level_map[child] = next_level
+                        if child in local_in_degree:
+                            local_in_degree[child] = max(0, local_in_degree[child] - 1)
+                        if child not in queue and local_in_degree.get(child, 0) == 0:
+                            queue.append(child)
+
+                unresolved = [cls for cls in component if cls not in level_map]
+                while unresolved:
+                    progressed = False
+                    for cls in unresolved[:]:
+                        neighbor_levels = [
+                            level_map[parent] + 1
+                            for parent in local_parents[cls]
+                            if parent in level_map
+                        ]
+                        neighbor_levels.extend(
+                            level_map[neighbor]
+                            for neighbor in all_connections[cls]
+                            if neighbor in level_map
+                        )
+                        if neighbor_levels:
+                            level_map[cls] = max(0, round(sum(neighbor_levels) / len(neighbor_levels)))
+                            unresolved.remove(cls)
+                            progressed = True
+                    if not progressed:
+                        fallback = max(unresolved, key=lambda cls: len(all_connections[cls]))
+                        level_map[fallback] = 0
+                        unresolved.remove(fallback)
+            else:
+                root = max(component, key=lambda cls: (len(all_connections[cls]), cls.name))
+                queue = [root]
+                level_map[root] = 0
+                seen = {root}
+                while queue:
+                    current = queue.pop(0)
+                    for neighbor in all_connections[current]:
+                        if neighbor in component_set and neighbor not in seen:
+                            seen.add(neighbor)
+                            level_map[neighbor] = level_map[current] + 1
+                            queue.append(neighbor)
+
+            min_level = min(level_map[cls] for cls in component)
+            for cls in component:
+                level_map[cls] -= min_level
+
+        max_level = max(level_map.values(), default=0)
+        levels = [[] for _ in range(max_level + 1)]
+        for cls in self.classes:
+            levels[level_map.get(cls, 0)].append(cls)
+
+        levels = [level for level in levels if level]
+        return levels, level_map, component_map
+
+    def sort_class_layout_levels(self, levels, hierarchy_children, hierarchy_parents, all_connections, component_map, sweeps=4):
+        """Reduce crossings by reordering each level using barycenter passes."""
+        for level in levels:
+            level.sort(key=lambda cls: (component_map.get(cls, 0), -len(all_connections[cls]), cls.name.lower()))
+
+        for _ in range(sweeps):
+            for level_idx in range(1, len(levels)):
+                previous_positions = {cls: idx for idx, cls in enumerate(levels[level_idx - 1])}
+
+                def top_down_key(cls):
+                    weights = []
+                    for parent in hierarchy_parents[cls]:
+                        if parent in previous_positions:
+                            weights.extend([previous_positions[parent]] * 4)
+                    for neighbor in all_connections[cls]:
+                        if neighbor in previous_positions:
+                            weights.append(previous_positions[neighbor])
+                    if weights:
+                        return (sum(weights) / len(weights), component_map.get(cls, 0), cls.name.lower())
+                    return (float("inf"), component_map.get(cls, 0), cls.name.lower())
+
+                levels[level_idx].sort(key=top_down_key)
+
+            for level_idx in range(len(levels) - 2, -1, -1):
+                next_positions = {cls: idx for idx, cls in enumerate(levels[level_idx + 1])}
+
+                def bottom_up_key(cls):
+                    weights = []
+                    for child in hierarchy_children[cls]:
+                        if child in next_positions:
+                            weights.extend([next_positions[child]] * 4)
+                    for neighbor in all_connections[cls]:
+                        if neighbor in next_positions:
+                            weights.append(next_positions[neighbor])
+                    if weights:
+                        return (sum(weights) / len(weights), component_map.get(cls, 0), cls.name.lower())
+                    return (float("inf"), component_map.get(cls, 0), cls.name.lower())
+
+                levels[level_idx].sort(key=bottom_up_key)
+
+    def distribute_class_level(self, level, desired_centers, anchor_x=200, gap=60):
+        """Place classes left-to-right near desired centers while preserving order and spacing."""
+        centers = {}
+        current_left = anchor_x
+
+        desired_average = 0.0
+        desired_count = 0
+        for cls in level:
+            desired = desired_centers.get(cls)
+            if desired is not None:
+                desired_average += desired
+                desired_count += 1
+
+        for cls in level:
+            half_width = cls.width / 2
+            desired = desired_centers.get(cls, current_left + half_width)
+            left = max(current_left, desired - half_width)
+            centers[cls] = left + half_width
+            current_left = left + cls.width + gap
+
+        if desired_count:
+            actual_average = sum(centers[cls] for cls in level) / len(level)
+            target_average = desired_average / desired_count
+            shift = target_average - actual_average
+            left_boundary = min(centers[cls] - cls.width / 2 for cls in level)
+            if left_boundary + shift < anchor_x:
+                shift += anchor_x - (left_boundary + shift)
+            if abs(shift) > 1:
+                for cls in level:
+                    centers[cls] += shift
+
+        return centers
+
+    def place_class_layout_levels(self, levels, hierarchy_children, hierarchy_parents, all_connections):
+        """Place each level, then relax horizontally to align related classes."""
+        start_x, start_y = 180, 140
+        horizontal_gap = 70
+        vertical_gap = 110
+        level_max_heights = [max((cls.height for cls in level), default=120) for level in levels]
+        y_positions = []
+        running_y = start_y
+        for level_height in level_max_heights:
+            y_positions.append(running_y)
+            running_y += level_height + vertical_gap
+
+        centers_by_class = {}
+        canvas_width = self.canvas.winfo_width() if self.canvas.winfo_width() > 1 else 1280
+
+        for level_idx, level in enumerate(levels):
+            if level_idx == 0:
+                level_width = sum(cls.width for cls in level) + max(0, len(level) - 1) * horizontal_gap
+                current_left = max(start_x, (canvas_width - level_width) / 2)
+                for cls in level:
+                    centers_by_class[cls] = current_left + (cls.width / 2)
+                    current_left += cls.width + horizontal_gap
+            else:
+                desired_centers = {}
+                for cls in level:
+                    anchors = []
+                    for parent in hierarchy_parents[cls]:
+                        if parent in centers_by_class:
+                            anchors.extend([centers_by_class[parent]] * 4)
+                    for neighbor in all_connections[cls]:
+                        if neighbor in centers_by_class:
+                            anchors.append(centers_by_class[neighbor])
+                    if anchors:
+                        desired_centers[cls] = sum(anchors) / len(anchors)
+                centers_by_class.update(
+                    self.distribute_class_level(level, desired_centers, anchor_x=start_x, gap=horizontal_gap)
+                )
+
+        for _ in range(6):
+            for level in levels:
+                desired_centers = {}
+                for cls in level:
+                    anchors = []
+                    for parent in hierarchy_parents[cls]:
+                        if parent in centers_by_class:
+                            anchors.extend([centers_by_class[parent]] * 4)
+                    for child in hierarchy_children[cls]:
+                        if child in centers_by_class:
+                            anchors.extend([centers_by_class[child]] * 3)
+                    for neighbor in all_connections[cls]:
+                        if neighbor in centers_by_class:
+                            anchors.append(centers_by_class[neighbor])
+                    anchors.append(centers_by_class.get(cls, cls.get_center()[0]))
+                    desired_centers[cls] = sum(anchors) / len(anchors)
+
+                centers_by_class.update(
+                    self.distribute_class_level(level, desired_centers, anchor_x=start_x, gap=horizontal_gap)
+                )
+
+        for level_idx, level in enumerate(levels):
+            target_y = y_positions[level_idx]
+            for cls in level:
+                target_x = centers_by_class[cls] - (cls.width / 2)
+                dx = target_x - cls.x
+                dy = target_y - cls.y
+                cls.move(dx, dy)
+
+    def resolve_class_level_overlaps(self, levels, min_gap=36):
+        """Resolve residual horizontal overlaps while preserving level structure."""
+        for level in levels:
+            if len(level) < 2:
+                continue
+            level.sort(key=lambda cls: cls.x)
+            current_right = None
+            for cls in level:
+                if current_right is None:
+                    current_right = cls.x + cls.width
+                    continue
+                minimum_left = current_right + min_gap
+                if cls.x < minimum_left:
+                    cls.move(minimum_left - cls.x, 0)
+                current_right = cls.x + cls.width
+
+            left_edge = min(cls.x for cls in level)
+            if left_edge < 180:
+                shift = 180 - left_edge
+                for cls in level:
+                    cls.move(shift, 0)
+
     def apply_hierarchical_layout(self):
-        """Apply hierarchical layout based on relationships with collision avoidance"""
+        """Apply a layered class layout with barycentric ordering and alignment passes."""
         if not self.classes:
             self.update_status("No classes to layout")
             return
         
         self.update_status("Applying hierarchical layout...")
-        
-        # Build dependency graph
-        graph = {}
-        in_degree = {}
-        all_connections = {}  # Track all relationships for proximity
-        
-        for cls in self.classes:
-            graph[cls] = []
-            in_degree[cls] = 0
-            all_connections[cls] = set()
-        
-        # Build graph from relationships (inheritance and composition create hierarchy)
-        for rel in self.relationships:
-            if rel.rel_type in ['inheritance', 'composition', 'realization']:
-                # Parent/container is at higher level
-                graph[rel.to_class].append(rel.from_class)
-                in_degree[rel.from_class] += 1
-            
-            # Track all connections for proximity
-            all_connections[rel.from_class].add(rel.to_class)
-            all_connections[rel.to_class].add(rel.from_class)
-        
-        # Topological sort to determine levels
-        levels = []
-        current_level = [cls for cls in self.classes if in_degree[cls] == 0]
-        
-        if not current_level:
-            # No clear hierarchy, use first class
-            current_level = [self.classes[0]]
-        
-        visited = set()
-        while current_level:
-            levels.append(current_level[:])
-            next_level = []
-            
-            for cls in current_level:
-                visited.add(cls)
-                for child in graph[cls]:
-                    if child not in visited:
-                        next_level.append(child)
-            
-            # Remove duplicates
-            next_level = list(dict.fromkeys(next_level))
-            current_level = next_level
-        
-        # Add any remaining classes that weren't in the hierarchy
-        remaining = [cls for cls in self.classes if cls not in visited]
-        if remaining:
-            levels.append(remaining)
-        
-        # Sort classes within each level to keep related ones together
-        for level in levels:
-            if len(level) > 1:
-                # Sort by number of connections to already-placed classes
-                sorted_level = []
-                remaining_in_level = level[:]
-                
-                # Start with the class that has most connections overall
-                if remaining_in_level:
-                    first = max(remaining_in_level, key=lambda c: len(all_connections[c]))
-                    sorted_level.append(first)
-                    remaining_in_level.remove(first)
-                
-                # Add remaining classes based on proximity to already sorted ones
-                while remaining_in_level:
-                    best_class = None
-                    best_score = -1
-                    
-                    for candidate in remaining_in_level:
-                        # Count connections to already sorted classes
-                        score = sum(1 for sorted_cls in sorted_level 
-                                  if sorted_cls in all_connections[candidate])
-                        
-                        if score > best_score:
-                            best_score = score
-                            best_class = candidate
-                    
-                    if best_class:
-                        sorted_level.append(best_class)
-                        remaining_in_level.remove(best_class)
-                    else:
-                        # No connections, just add the first one
-                        sorted_level.append(remaining_in_level[0])
-                        remaining_in_level.pop(0)
-                
-                # Update the level with sorted order
-                level[:] = sorted_level
-        
-        # Calculate maximum width needed for each class in each level
-        level_max_widths = []
-        for level in levels:
-            max_width = max([cls.width for cls in level]) if level else 200
-            level_max_widths.append(max_width)
-        
-        # Calculate maximum height needed for each level
-        level_max_heights = []
-        for level in levels:
-            max_height = max([cls.height for cls in level]) if level else 120
-            level_max_heights.append(max_height)
-        
-        # Position classes based on levels with proper spacing
-        start_x, start_y = 200, 150
-        horizontal_gap = 60  # Reduced gap for closer placement
-        vertical_gap = 100   # Gap between levels vertically
-        
-        for level_idx, level in enumerate(levels):
-            # Calculate Y position for this level
-            y = start_y + sum(level_max_heights[:level_idx]) + level_idx * vertical_gap
-            
-            # Calculate total width needed for this level
-            total_width = sum([cls.width for cls in level]) + (len(level) - 1) * horizontal_gap
-            
-            # Center the level horizontally
-            canvas_width = self.canvas.winfo_width() if self.canvas.winfo_width() > 1 else 1200
-            start_x_level = max(start_x, (canvas_width - total_width) / 2)
-            
-            # Position each class in the level
-            current_x = start_x_level
-            for cls in level:
-                # Move class to new position (center it vertically within the level)
-                target_x = current_x
-                target_y = y
-                
-                dx = target_x - cls.x
-                dy = target_y - cls.y
-                cls.move(dx, dy)
-                
-                # Move to next position
-                current_x += cls.width + horizontal_gap
-        
-        # Apply force-directed adjustment to bring connected classes closer
-        self.apply_force_directed_layout(all_connections, levels, iterations=5)
-        
-        # Resolve any remaining overlaps with iterative adjustment
-        self.resolve_overlaps()
-        
-        # Update all relationships
+
+        hierarchy_children, hierarchy_parents, all_connections = self.build_class_layout_graphs()
+        levels, _, component_map = self.compute_class_layout_levels(
+            hierarchy_children,
+            hierarchy_parents,
+            all_connections,
+        )
+        self.sort_class_layout_levels(
+            levels,
+            hierarchy_children,
+            hierarchy_parents,
+            all_connections,
+            component_map,
+        )
+        self.place_class_layout_levels(
+            levels,
+            hierarchy_children,
+            hierarchy_parents,
+            all_connections,
+        )
+        self.resolve_class_level_overlaps(levels)
+
         self.update_relationships()
         self.update_scroll_region()
         
@@ -7048,6 +7810,270 @@ class MermaidDiagramTool:
         
         # Check for overlap
         return not (right1 < left2 or right2 < left1 or bottom1 < top2 or bottom2 < top1)
+
+    def apply_auto_layout(self):
+        """Apply the most appropriate automatic layout for the active diagram type."""
+        if self.diagram_type == "flowchart":
+            self.apply_flowchart_layout()
+        elif self.diagram_type == "sequenceDiagram":
+            self.apply_sequence_layout()
+        elif self.diagram_type == "stateDiagram":
+            self.apply_state_layout()
+        elif self.diagram_type == "erDiagram":
+            self.apply_er_layout()
+        else:
+            self.apply_hierarchical_layout()
+
+    def move_diagram_item_to(self, item, target_x, target_y):
+        dx = target_x - item.x
+        dy = target_y - item.y
+        if abs(dx) < 0.01 and abs(dy) < 0.01:
+            return
+
+        if isinstance(item, ClassBox):
+            item.move(dx, dy)
+            return
+
+        item.x += dx
+        item.y += dy
+
+        if isinstance(item, SequenceActor):
+            for visual_item in item.visual_items:
+                self.canvas.move(visual_item, dx, dy)
+            if item.primary_bbox:
+                item.primary_bbox = (
+                    item.primary_bbox[0] + dx,
+                    item.primary_bbox[1] + dy,
+                    item.primary_bbox[2] + dx,
+                    item.primary_bbox[3] + dy,
+                )
+            return
+
+        if isinstance(item, FlowchartNode):
+            self.canvas.move(item.shape_item, dx, dy)
+            self.canvas.move(item.text_item, dx, dy)
+            return
+
+        self.canvas.move(item.box, dx, dy)
+        if getattr(item, "text_item", None):
+            self.canvas.move(item.text_item, dx, dy)
+
+    def get_layout_item_size(self, item):
+        zoom_level = self.zoom_level if hasattr(self, "zoom_level") else 1.0
+        return (
+            max(60, getattr(item, "width", 120) * zoom_level),
+            max(40, getattr(item, "height", 80) * zoom_level),
+        )
+
+    def build_directed_layout_levels(self, items, edge_pairs):
+        outgoing = {item: [] for item in items}
+        incoming = {item: [] for item in items}
+        neighbors = {item: set() for item in items}
+
+        for source, target in edge_pairs:
+            if source not in outgoing or target not in outgoing:
+                continue
+            outgoing[source].append(target)
+            incoming[target].append(source)
+            neighbors[source].add(target)
+            neighbors[target].add(source)
+
+        in_degree = {item: len(incoming[item]) for item in items}
+        roots = [item for item in items if in_degree[item] == 0]
+        if not roots and items:
+            roots = [max(items, key=lambda item: len(outgoing[item]) + len(neighbors[item]))]
+
+        level_map = {root: 0 for root in roots}
+        queue = roots[:]
+        pending = in_degree.copy()
+
+        while queue:
+            current = queue.pop(0)
+            current_level = level_map[current]
+            for child in outgoing[current]:
+                next_level = current_level + 1
+                if next_level > level_map.get(child, -1):
+                    level_map[child] = next_level
+                pending[child] = max(0, pending[child] - 1)
+                if pending[child] == 0 and child not in queue:
+                    queue.append(child)
+
+        unresolved = [item for item in items if item not in level_map]
+        while unresolved:
+            progressed = False
+            for item in unresolved[:]:
+                anchor_levels = [level_map[parent] + 1 for parent in incoming[item] if parent in level_map]
+                if anchor_levels:
+                    level_map[item] = max(anchor_levels)
+                    unresolved.remove(item)
+                    progressed = True
+            if not progressed:
+                fallback = max(unresolved, key=lambda item: len(neighbors[item]))
+                level_map[fallback] = 0
+                unresolved.remove(fallback)
+
+        levels = []
+        for item in items:
+            level = level_map.get(item, 0)
+            while len(levels) <= level:
+                levels.append([])
+            levels[level].append(item)
+
+        return levels, outgoing, incoming, neighbors
+
+    def sort_layout_levels(self, levels, incoming, outgoing, neighbors, sweeps=3):
+        for level in levels:
+            level.sort(key=lambda item: getattr(item, "x", 0))
+
+        for _ in range(sweeps):
+            for index in range(1, len(levels)):
+                previous_positions = {item: pos for pos, item in enumerate(levels[index - 1])}
+
+                def top_key(item):
+                    weights = []
+                    for parent in incoming[item]:
+                        if parent in previous_positions:
+                            weights.extend([previous_positions[parent]] * 4)
+                    for neighbor in neighbors[item]:
+                        if neighbor in previous_positions:
+                            weights.append(previous_positions[neighbor])
+                    return sum(weights) / len(weights) if weights else getattr(item, "x", 0)
+
+                levels[index].sort(key=top_key)
+
+            for index in range(len(levels) - 2, -1, -1):
+                next_positions = {item: pos for pos, item in enumerate(levels[index + 1])}
+
+                def bottom_key(item):
+                    weights = []
+                    for child in outgoing[item]:
+                        if child in next_positions:
+                            weights.extend([next_positions[child]] * 4)
+                    for neighbor in neighbors[item]:
+                        if neighbor in next_positions:
+                            weights.append(next_positions[neighbor])
+                    return sum(weights) / len(weights) if weights else getattr(item, "x", 0)
+
+                levels[index].sort(key=bottom_key)
+
+    def place_layout_levels(self, levels, orientation="TB", start_x=140, start_y=120, primary_gap=110, secondary_gap=80):
+        reverse_primary = orientation in {"BT", "RL"}
+        horizontal = orientation in {"LR", "RL"}
+        ordered_levels = list(reversed(levels)) if reverse_primary else levels
+        canvas_width = self.canvas.winfo_width() if self.canvas.winfo_width() > 1 else 1200
+        canvas_height = self.canvas.winfo_height() if self.canvas.winfo_height() > 1 else 900
+
+        if horizontal:
+            primary_cursor = start_x
+            for level in ordered_levels:
+                level_sizes = [self.get_layout_item_size(item) for item in level]
+                level_primary_size = max((size[0] for size in level_sizes), default=120)
+                total_secondary = sum(size[1] for size in level_sizes) + max(0, len(level) - 1) * secondary_gap
+                secondary_cursor = max(start_y, start_y + (canvas_height - total_secondary) / 2)
+                for item, (width, height) in zip(level, level_sizes):
+                    self.move_diagram_item_to(item, primary_cursor, secondary_cursor)
+                    secondary_cursor += height + secondary_gap
+                primary_cursor += level_primary_size + primary_gap
+            return
+
+        primary_cursor = start_y
+        for level in ordered_levels:
+            level_sizes = [self.get_layout_item_size(item) for item in level]
+            level_primary_size = max((size[1] for size in level_sizes), default=80)
+            total_secondary = sum(size[0] for size in level_sizes) + max(0, len(level) - 1) * secondary_gap
+            secondary_cursor = max(start_x, start_x + (canvas_width - total_secondary) / 2)
+            for item, (width, height) in zip(level, level_sizes):
+                self.move_diagram_item_to(item, secondary_cursor, primary_cursor)
+                secondary_cursor += width + secondary_gap
+            primary_cursor += level_primary_size + primary_gap
+
+    def apply_flowchart_layout(self):
+        if not self.flowchart_nodes:
+            self.update_status("No nodes to layout")
+            return
+
+        self.update_status("Applying flowchart layout...")
+        edges = [(connection.from_node, connection.to_node) for connection in self.flowchart_connections]
+        levels, outgoing, incoming, neighbors = self.build_directed_layout_levels(self.flowchart_nodes, edges)
+        self.sort_layout_levels(levels, incoming, outgoing, neighbors)
+        self.place_layout_levels(
+            levels,
+            orientation=getattr(self, "flowchart_direction", "TD") or "TD",
+            start_x=140,
+            start_y=120,
+            primary_gap=120,
+            secondary_gap=90,
+        )
+        self.update_relationships()
+        self.update_scroll_region()
+        self.ensure_grid_behind()
+        self.mark_as_changed()
+        self.update_status(f"Flowchart layout applied to {len(self.flowchart_nodes)} nodes")
+
+    def apply_sequence_layout(self):
+        if not self.sequence_actors:
+            self.update_status("No participants to layout")
+            return
+
+        self.update_status("Applying sequence layout...")
+        ordered_actors = sorted(self.sequence_actors, key=lambda actor: actor.x)
+        canvas_width = self.canvas.winfo_width() if self.canvas.winfo_width() > 1 else 1200
+        sizes = [self.get_layout_item_size(actor) for actor in ordered_actors]
+        gap = 100
+        total_width = sum(width for width, _ in sizes) + max(0, len(ordered_actors) - 1) * gap
+        cursor_x = max(120, (canvas_width - total_width) / 2)
+        top_y = 70
+
+        for actor, (width, _) in zip(ordered_actors, sizes):
+            self.move_diagram_item_to(actor, cursor_x, top_y)
+            cursor_x += width + gap
+
+        self.sequence_actors[:] = ordered_actors
+        self.reindex_sequence_messages()
+        self.update_relationships()
+        self.update_scroll_region()
+        self.ensure_grid_behind()
+        self.mark_as_changed()
+        self.update_status(f"Sequence layout applied to {len(self.sequence_actors)} participants")
+
+    def apply_state_layout(self):
+        if not self.state_nodes:
+            self.update_status("No states to layout")
+            return
+
+        self.update_status("Applying state layout...")
+        edges = [(transition.from_state, transition.to_state) for transition in self.state_transitions]
+        levels, outgoing, incoming, neighbors = self.build_directed_layout_levels(self.state_nodes, edges)
+        self.sort_layout_levels(levels, incoming, outgoing, neighbors)
+        self.place_layout_levels(levels, orientation="TD", start_x=140, start_y=130, primary_gap=120, secondary_gap=100)
+        self.update_relationships()
+        self.update_scroll_region()
+        self.ensure_grid_behind()
+        self.mark_as_changed()
+        self.update_status(f"State layout applied to {len(self.state_nodes)} states")
+
+    def apply_er_layout(self):
+        if not self.er_entities:
+            self.update_status("No entities to layout")
+            return
+
+        self.update_status("Applying ER layout...")
+        edges = [(relationship.from_entity, relationship.to_entity) for relationship in self.er_relationships]
+        levels, outgoing, incoming, neighbors = self.build_directed_layout_levels(self.er_entities, edges)
+        self.sort_layout_levels(levels, incoming, outgoing, neighbors)
+        self.place_layout_levels(
+            levels,
+            orientation=(self.er_direction or "LR").upper(),
+            start_x=150,
+            start_y=140,
+            primary_gap=140,
+            secondary_gap=110,
+        )
+        self.update_relationships()
+        self.update_scroll_region()
+        self.ensure_grid_behind()
+        self.mark_as_changed()
+        self.update_status(f"ER layout applied to {len(self.er_entities)} entities")
     
     def generate_mermaid(self):
         if self.diagram_type == "flowchart":
@@ -7062,7 +8088,8 @@ class MermaidDiagramTool:
             return self.generate_class_diagram()
     
     def generate_flowchart(self):
-        lines = ["flowchart TD"]
+        lines = [f"flowchart {getattr(self, 'flowchart_direction', 'TD') or 'TD'}"]
+        lines.extend(f"    {line}" if not line.startswith("    ") else line for line in getattr(self, "flowchart_preserved_lines", []))
         
         # Add nodes
         for node in self.flowchart_nodes:
@@ -7104,13 +8131,36 @@ class MermaidDiagramTool:
             if actor_name != actor_id:
                 declaration += f" as {actor_name}"
             lines.append(declaration)
+        message_iter = iter(self.sequence_messages)
         arrow_map = {
             "sync": "->>",
             "async": "-->",
             "return": "-->>",
             "note": "--"
         }
-        for message in self.sequence_messages:
+        export_rows = self.sequence_export_rows or [{"type": "message"} for _ in self.sequence_messages]
+        for row in export_rows:
+            if row.get("type") == "raw":
+                for raw_line in row.get("lines", []):
+                    lines.append(f"    {raw_line}" if raw_line and not raw_line.startswith("    ") else raw_line)
+                continue
+            if row.get("type") == "note":
+                actor_ids = row.get("actor_ids", [])
+                actor_text = ",".join(actor_ids)
+                lines.append(f"    Note {row.get('placement', 'over')} {actor_text}: {row.get('text', '')}")
+                continue
+            message = next(message_iter, None)
+            if not message:
+                continue
+            for directive in getattr(message, "directives_before", []):
+                lines.append(f"    {directive}")
+            source = getattr(message.from_actor, "actor_id", message.from_actor.name.replace(" ", "_"))
+            target = getattr(message.to_actor, "actor_id", message.to_actor.name.replace(" ", "_"))
+            symbol = getattr(message, "arrow_symbol", arrow_map.get(message.msg_type, "->>"))
+            left_sep = "" if symbol.startswith("()") else " "
+            right_sep = "" if symbol.endswith("()") else " "
+            lines.append(f"    {source}{left_sep}{symbol}{right_sep}{target} : {message.label}")
+        for message in message_iter:
             for directive in getattr(message, "directives_before", []):
                 lines.append(f"    {directive}")
             source = getattr(message.from_actor, "actor_id", message.from_actor.name.replace(" ", "_"))
@@ -7125,11 +8175,16 @@ class MermaidDiagramTool:
 
     def generate_state_diagram(self):
         lines = ["stateDiagram-v2"]
+        lines.extend(f"    {line}" if not line.startswith("    ") else line for line in getattr(self, "state_preserved_lines", []))
         for state in self.state_nodes:
+            if getattr(state, "state_kind", "normal") != "normal":
+                continue
             state_name = state.name.replace("\n", " ").strip() or "State"
             lines.append(f"    state {state_name}")
         for transition in self.state_transitions:
-            line = f"    {transition.from_state.name} --> {transition.to_state.name}"
+            from_name = "[*]" if getattr(transition.from_state, "state_kind", "normal") == "start" else transition.from_state.name
+            to_name = "[*]" if getattr(transition.to_state, "state_kind", "normal") == "end" else transition.to_state.name
+            line = f"    {from_name} --> {to_name}"
             if transition.label:
                 line += f" : {transition.label}"
             lines.append(line)
@@ -7139,6 +8194,7 @@ class MermaidDiagramTool:
         lines = ["erDiagram"]
         if self.er_direction:
             lines.append(f"    direction {self.er_direction}")
+        lines.extend(f"    {line}" if not line.startswith("    ") else line for line in getattr(self, "er_preserved_lines", []))
         for entity in self.er_entities:
             entity_id = getattr(entity, "entity_id", entity.name.replace(" ", "_").upper()) or "ENTITY"
             entity_alias = getattr(entity, "entity_alias", None)
@@ -7167,6 +8223,7 @@ class MermaidDiagramTool:
     
     def generate_class_diagram(self):
         lines = ["classDiagram"]
+        lines.extend(f"    {line}" if not line.startswith("    ") else line for line in getattr(self, "class_preserved_lines", []))
         
         # Add classes with enhanced features
         for class_box in self.classes:
@@ -7674,5 +8731,6 @@ class MermaidDiagramTool:
         self.root.mainloop()
 
 if __name__ == "__main__":
-    app = MermaidDiagramTool()
+    startup_file = sys.argv[1] if len(sys.argv) > 1 else None
+    app = MermaidDiagramTool(startup_file=startup_file)
     app.run()

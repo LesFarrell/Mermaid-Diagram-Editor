@@ -1,40 +1,29 @@
 from pathlib import Path
-import time
-
-from PIL import ImageGrab
 
 from mermaid_diagram_tool import MermaidDiagramTool
 
 
 SAMPLES = [
-    "sample_flowchart.md",
-    "sample_sequence_diagram.md",
-    "sample_state_diagram.md",
-    "sample_er_diagram.md",
-    "sample_class_diagram.md",
+    "samples/sample_flowchart.md",
+    "samples/sample_sequence_diagram.md",
+    "samples/sample_state_diagram.md",
+    "samples/sample_er_diagram.md",
+    "samples/sample_class_diagram.md",
 ]
 
-
 def capture_canvas(tool, output_path):
-    tool.root.update_idletasks()
-    tool.root.update()
-    time.sleep(0.3)
-    tool.root.update_idletasks()
-    tool.root.update()
-
-    x1 = tool.canvas.winfo_rootx()
-    y1 = tool.canvas.winfo_rooty()
-    x2 = x1 + tool.canvas.winfo_width()
-    y2 = y1 + tool.canvas.winfo_height()
-
-    image = ImageGrab.grab(bbox=(x1, y1, x2, y2))
-    image.save(output_path)
+    tool.canvas.update_idletasks()
+    export_bounds = tool.get_export_bounds()
+    if not export_bounds:
+        raise RuntimeError("No canvas content available for export")
+    image = tool.render_canvas_to_png_image(export_bounds)
+    image.save(output_path, format="PNG")
 
 
 def main():
     base_dir = Path(__file__).resolve().parent
-    output_dir = base_dir / "render_checks"
-    output_dir.mkdir(exist_ok=True)
+    output_dir = base_dir / "docs" / "screenshots"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     tool = MermaidDiagramTool()
     tool.root.geometry("1400x950+100+100")

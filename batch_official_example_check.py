@@ -4,12 +4,11 @@ import json
 import math
 import re
 import textwrap
-import time
 import urllib.request
 from collections import defaultdict
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont, ImageGrab
+from PIL import Image, ImageDraw, ImageFont
 
 from mermaid_diagram_tool import MermaidDiagramTool
 
@@ -49,27 +48,10 @@ def strip_front_matter(text: str) -> str:
 
 
 def normalize_example_text(raw: str) -> str:
-    text = raw.strip()
+    text = textwrap.dedent(raw).strip()
     text = re.sub(r"^---.*?---\s*", "", text, flags=re.DOTALL)
-    text = re.sub(r"\s+", " ", text).strip()
-    lines = []
-    for token in text.split(" "):
-        if not lines:
-            lines.append(token)
-            continue
-        if token in {"end", "else", "opt", "alt", "par", "and", "loop"}:
-            lines.append(token)
-        elif token.startswith("%%"):
-            lines.append(token)
-        elif token in {"classDiagram", "sequenceDiagram", "erDiagram", "stateDiagram", "stateDiagram-v2"}:
-            lines.append(token)
-        elif token in {"flowchart", "graph"}:
-            lines.append(token)
-        elif lines[-1] in {"flowchart", "graph"} and token in {"TD", "TB", "LR", "RL", "BT"}:
-            lines[-1] = f"{lines[-1]} {token}"
-        else:
-            lines[-1] += f" {token}"
-    return "\n".join(line.strip() for line in lines if line.strip())
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    return "\n".join(lines)
 
 
 def extract_examples(text: str, source_name: str) -> list[dict]:
@@ -116,15 +98,11 @@ def diagram_type(diagram: str) -> str:
 
 def capture_canvas(tool: MermaidDiagramTool, output_path: Path) -> None:
     tool.root.update_idletasks()
-    tool.root.update()
-    time.sleep(0.15)
-    tool.root.update_idletasks()
-    tool.root.update()
-    x1 = tool.canvas.winfo_rootx()
-    y1 = tool.canvas.winfo_rooty()
-    x2 = x1 + tool.canvas.winfo_width()
-    y2 = y1 + tool.canvas.winfo_height()
-    ImageGrab.grab(bbox=(x1, y1, x2, y2)).save(output_path)
+    export_bounds = tool.get_export_bounds()
+    if not export_bounds:
+        raise RuntimeError("No canvas content available for export")
+    image = tool.render_canvas_to_png_image(export_bounds)
+    image.save(output_path, format="PNG")
 
 
 def load_font(size: int):
@@ -134,7 +112,7 @@ def load_font(size: int):
         return ImageFont.load_default()
 
 
-def build_contact_sheet(image_paths: list[Path], labels: list[str], output_path: Path, title: str) -> None:
+def build_contact_sheet_page(image_paths: list[Path], labels: list[str], output_path: Path, title: str) -> None:
     if not image_paths:
         return
 
@@ -167,6 +145,30 @@ def build_contact_sheet(image_paths: list[Path], labels: list[str], output_path:
         draw.text((x, y + thumb_h + 8), label[:70], fill="black", font=label_font)
 
     sheet.save(output_path)
+
+
+def build_contact_sheets(image_paths: list[Path], labels: list[str], output_path: Path, title: str, max_per_sheet: int = 12) -> None:
+    if not image_paths:
+        return
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    chunks = [
+        (image_paths[index:index + max_per_sheet], labels[index:index + max_per_sheet])
+        for index in range(0, len(image_paths), max_per_sheet)
+    ]
+
+    if len(chunks) == 1:
+        build_contact_sheet_page(chunks[0][0], chunks[0][1], output_path, title)
+        return
+
+    stem = output_path.stem
+    suffix = output_path.suffix
+    for page_index, (page_images, page_labels) in enumerate(chunks, 1):
+        page_title = f"{title} (Page {page_index}/{len(chunks)})"
+        page_name = output_path.with_name(f"{stem}_{page_index:02d}{suffix}")
+        build_contact_sheet_page(page_images, page_labels, page_name, page_title)
+
+    build_contact_sheet_page(chunks[0][0], chunks[0][1], output_path, f"{title} (Page 1/{len(chunks)})")
 
 
 def main() -> None:
@@ -233,7 +235,7 @@ def main() -> None:
         tool.root.destroy()
 
     for dtype, image_paths in grouped_images.items():
-        build_contact_sheet(
+        build_contact_sheets(
             image_paths,
             grouped_labels[dtype],
             output_dir / f"{dtype}_contact_sheet.png",

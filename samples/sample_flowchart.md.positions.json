@@ -1,0 +1,51 @@
+{
+  "zoom_level": 1.0,
+  "canvas_viewport": {
+    "xview": [
+      0.0,
+      1.0
+    ],
+    "yview": [
+      0.022941970310391364,
+      1.0
+    ]
+  },
+  "classes": {},
+  "flowchart_nodes": {
+    "Start": {
+      "x": 150.0,
+      "y": 150.0
+    },
+    "Login": {
+      "x": 325.0,
+      "y": -16.0
+    },
+    "Check": {
+      "x": 542.0,
+      "y": 3.0
+    },
+    "Dashboard": {
+      "x": 750.0,
+      "y": 150.0
+    },
+    "Error": {
+      "x": 428.0,
+      "y": 330.0
+    },
+    "Reports": {
+      "x": 422.0,
+      "y": 462.0
+    },
+    "End": {
+      "x": 726.0,
+      "y": 407.0
+    }
+  },
+  "sequence_actors": {},
+  "state_nodes": {},
+  "er_entities": {},
+  "metadata": {
+    "version": "1.3",
+    "saved_at": "1777305341.1643622"
+  }
+}

@@ -2,6 +2,20 @@
 
 A visual drag-and-drop tool for creating UML class diagrams that exports to Mermaid format.
 
+## Screenshots
+
+### Class Diagram
+![Class diagram screenshot](docs/screenshots/sample_class_diagram.png)
+
+### Flowchart
+![Flowchart screenshot](docs/screenshots/sample_flowchart.png)
+
+### Sequence Diagram
+![Sequence diagram screenshot](docs/screenshots/sample_sequence_diagram.png)
+
+### ER Diagram
+![ER diagram screenshot](docs/screenshots/sample_er_diagram.png)
+
 ## Features
 
 - **Visual Interface**: Drag and drop classes on a canvas workspace with improved spacing
@@ -21,12 +35,35 @@ A visual drag-and-drop tool for creating UML class diagrams that exports to Merm
 python mermaid_diagram_tool.py
 ```
 
+Open a diagram directly from the command line:
+```bash
+python mermaid_diagram_tool.py samples/sample_class_diagram.md
+```
+
+### Building a Standalone EXE with Nuitka
+Install build dependencies:
+```bash
+python -m pip install nuitka -r requirements.txt
+```
+
+Build a standalone Windows distribution:
+```powershell
+.\build_nuitka.ps1
+```
+
+Build a one-file executable:
+```powershell
+.\build_nuitka.ps1 -Mode onefile
+```
+
+The build script includes the `samples` folder and the app config file when present.
+
 ### Sample Diagrams
-- `sample_class_diagram.md`
-- `sample_flowchart.md`
-- `sample_sequence_diagram.md`
-- `sample_state_diagram.md`
-- `sample_er_diagram.md`
+- `samples/sample_class_diagram.md`
+- `samples/sample_flowchart.md`
+- `samples/sample_sequence_diagram.md`
+- `samples/sample_state_diagram.md`
+- `samples/sample_er_diagram.md`
 
 ### Creating Classes
 - Click "Add Class" button to create a new class (auto-selected)

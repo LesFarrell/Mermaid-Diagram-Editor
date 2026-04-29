@@ -7,9 +7,9 @@ from mermaid_diagram_tool import MermaidDiagramTool
 
 
 VIEWS = [
-    ("classDiagram", "sample_class_diagram.md", "ui_class.png"),
-    ("flowchart", "sample_flowchart.md", "ui_flowchart.png"),
-    ("sequenceDiagram", "sample_sequence_diagram.md", "ui_sequence.png"),
+    ("classDiagram", "samples/sample_class_diagram.md", "ui_class.png"),
+    ("flowchart", "samples/sample_flowchart.md", "ui_flowchart.png"),
+    ("sequenceDiagram", "samples/sample_sequence_diagram.md", "ui_sequence.png"),
 ]
 
 
