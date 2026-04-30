@@ -96,19 +96,27 @@ def create_rounded_rectangle(canvas, x1, y1, x2, y2, radius, **kwargs):
 
     points = [
         x1 + radius, y1,
+        x1 + radius, y1,
+        x2 - radius, y1,
         x2 - radius, y1,
         x2, y1,
         x2, y1 + radius,
+        x2, y1 + radius,
+        x2, y2 - radius,
         x2, y2 - radius,
         x2, y2,
         x2 - radius, y2,
+        x2 - radius, y2,
+        x1 + radius, y2,
         x1 + radius, y2,
         x1, y2,
         x1, y2 - radius,
+        x1, y2 - radius,
+        x1, y1 + radius,
         x1, y1 + radius,
         x1, y1,
     ]
-    return canvas.create_polygon(points, smooth=True, splinesteps=20, **kwargs)
+    return canvas.create_polygon(points, smooth=True, splinesteps=16, **kwargs)
 
 
 def measure_wrapped_text(canvas, text, font, target_width, minimum_width=80, max_width=320):
@@ -4716,9 +4724,14 @@ class MermaidDiagramTool:
             if shape_type == "rectangle":
                 icon_canvas.create_rectangle(18, 10, 98, 34, fill=color, outline="black", width=2)
             elif shape_type == "rounded":
-                icon_canvas.create_rectangle(18, 10, 98, 34, fill=color, outline="black", width=2)
-                icon_canvas.create_oval(16, 8, 24, 16, fill=color, outline="black", width=1)
-                icon_canvas.create_oval(92, 8, 100, 16, fill=color, outline="black", width=1)
+                create_rounded_rectangle(
+                    icon_canvas,
+                    18, 10, 98, 34,
+                    radius=10,
+                    fill=color,
+                    outline="black",
+                    width=2,
+                )
             elif shape_type == "diamond":
                 icon_canvas.create_polygon(58, 8, 102, 22, 58, 36, 14, 22, fill=color, outline="black", width=2)
             elif shape_type == "circle":
